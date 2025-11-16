@@ -1,0 +1,614 @@
+//package com.indusind.trade.api.gateway.filters;
+//
+//import java.nio.charset.StandardCharsets;
+//
+//import org.reactivestreams.Publisher;
+//import org.slf4j.Logger;
+//import org.slf4j.LoggerFactory;
+//import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+//import org.springframework.cloud.gateway.filter.GlobalFilter;
+//import org.springframework.core.Ordered;
+//import org.springframework.core.io.buffer.DataBuffer;
+//import org.springframework.core.io.buffer.DataBufferUtils;
+//import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+//import org.springframework.http.MediaType;
+//import org.springframework.http.server.reactive.ServerHttpResponse;
+//import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
+//import org.springframework.stereotype.Component;
+//import org.springframework.web.server.ServerWebExchange;
+//
+//import com.indusind.trade.api.gateway.utils.AESCryptoUtils;
+//
+//import reactor.core.publisher.Flux;
+//import reactor.core.publisher.Mono;
+//
+//@Component
+//public class CryptoResponseFilter implements GlobalFilter, Ordered {
+//
+//	private static final Logger log = LoggerFactory.getLogger(CryptoResponseFilter.class);
+//
+//	@Override
+//	public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+//		ServerHttpResponse originalResponse = exchange.getResponse();
+//
+//		ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+//			@Override
+//			public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
+//				return super.writeWith(Flux.from(body).flatMap(dataBuffer -> {
+//					byte[] responseBytes = new byte[dataBuffer.readableByteCount()];
+//					dataBuffer.read(responseBytes);
+//					DataBufferUtils.release(dataBuffer);
+//
+//					String originalResponseBody = new String(responseBytes, StandardCharsets.UTF_8);
+//					String encryptedResponseBody = safeEncrypt(originalResponseBody);
+//					byte[] encryptedBytes = encryptedResponseBody.getBytes(StandardCharsets.UTF_8);
+//					DataBuffer encryptedBuffer = new DefaultDataBufferFactory().wrap(encryptedBytes);
+//
+//					getHeaders().setContentLength(encryptedBytes.length);
+//					getHeaders().setContentType(MediaType.TEXT_PLAIN);
+//
+//					return Mono.just(encryptedBuffer);
+//
+////					ByteBuffer byteBuffer = dataBuffer.asByteBuffer();
+////                    byte[] responseBytes = new byte[byteBuffer.remaining()];
+////                    byteBuffer.get(responseBytes);
+////                    DataBufferUtils.release(dataBuffer);
+////
+////                    // Encrypt response
+////                    byte[] encryptedBytes = AESUtils.encryptBytes(responseBytes);
+////                    DataBuffer encryptedBuffer = new DefaultDataBufferFactory().wrap(encryptedBytes);
+////
+////                    // Preserve original content type or default to JSON
+////                    MediaType originalContentType = getHeaders().getContentType();
+////                    getHeaders().setContentType(originalContentType != null ? originalContentType : MediaType.APPLICATION_JSON);
+////                    getHeaders().setContentLength(encryptedBytes.length);
+////
+////                    return Mono.just(encryptedBuffer);
+//				}));
+//			}
+//		};
+//
+//		return chain.filter(exchange.mutate().response(decoratedResponse).build());
+//	}
+//
+//	private String safeEncrypt(String value) {
+//		try {
+//			if (value.contains("\"error\""))
+//				return value;
+//			return AESCryptoUtils.encrypt(value);
+//		} catch (Exception e) {
+//			log.warn("Encryption failed for value: {}", value);
+//			throw new RuntimeException("Encryption failed", e);
+//		}
+//	}
+//
+//	@Override
+//	public int getOrder() {
+//		return Ordered.LOWEST_PRECEDENCE - 10;
+//	}
+//
+//}
+package com.indusind.trade.api.gateway.filters;
+
+import java.nio.charset.StandardCharsets;
+
+import org.reactivestreams.Publisher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
+import org.springframework.stereotype.Component;
+import org.springframework.web.server.ServerWebExchange;
+
+import com.indusind.trade.api.gateway.utils.AESCryptoUtils;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Component
+public class CryptoResponseFilter implements GlobalFilter, Ordered {
+
+    private static final Logger log = LoggerFactory.getLogger(CryptoResponseFilter.class);
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+    	ServerHttpResponse originalResponse = exchange.getResponse();
+
+        // Decorate the response to intercept body
+        ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+            @Override
+            public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
+                // If response is already committed or body is not Flux, just pass through
+                if (isCommitted() || !(body instanceof Flux)) {
+                    return super.writeWith(body);
+                }
+
+                Flux<DataBuffer> fluxBody = Flux.from(body);
+
+                // Aggregate full response body before encryption
+                return DataBufferUtils.join(fluxBody)
+                        .flatMap(dataBuffer -> {
+                            byte[] content = new byte[dataBuffer.readableByteCount()];
+                            dataBuffer.read(content);
+                            DataBufferUtils.release(dataBuffer);
+
+                            String originalBody = new String(content, StandardCharsets.UTF_8);
+
+                            // Skip encryption for error or empty body
+                            if (getStatusCode() == null || !getStatusCode().is2xxSuccessful() || originalBody.isBlank()) {
+                                log.debug("Skipping encryption for status: {} or empty body", getStatusCode());
+                                return writeResponse(originalBody);
+                            }
+
+                            try {
+                                String encryptedBody = safeEncrypt(originalBody);
+                                return writeResponse(encryptedBody);
+                            } catch (Exception e) {
+                                log.error("Encryption failed, returning original response", e);
+                                return writeResponse(originalBody);
+                            }
+                        });
+            }
+
+            /**
+             * Writes the given body back to the response.
+             */
+            private Mono<Void> writeResponse(String body) {
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                getHeaders().setContentLength(bytes.length);
+
+                // Preserve original content type or default to JSON
+                MediaType originalContentType = getHeaders().getContentType();
+                getHeaders().setContentType(originalContentType != null ? originalContentType : MediaType.APPLICATION_JSON);
+
+                DataBuffer buffer = new DefaultDataBufferFactory().wrap(bytes);
+                return super.writeWith(Mono.just(buffer));
+            }
+        };
+
+        return chain.filter(exchange.mutate().response(decoratedResponse).build());
+    }
+
+    private String safeEncrypt(String value) {
+        try {
+            // Skip encryption if response contains error JSON
+            if (value.contains("\"error\"")) {
+                log.debug("Skipping encryption for error response");
+                return value;
+            }
+            return AESCryptoUtils.encrypt(value);
+        } catch (Exception e) {
+            log.warn("Encryption failed for value: {}", value, e);
+            return value; // Fallback: return original body
+        }
+    }
+
+    @Override
+    public int getOrder() {
+        return Ordered.LOWEST_PRECEDENCE - 10;
+    }
+}
+
+package com.indusind.trade.api.gateway.filters;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.util.List;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
+import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.server.ServerWebExchange;
+
+import com.indusind.trade.api.gateway.utils.AESCryptoUtils;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Component
+public class CryptoRequestFilter implements GlobalFilter, Ordered {
+
+	private static final Logger log = LoggerFactory.getLogger(CryptoRequestFilter.class);
+	private static final int MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB limit
+
+	@Override
+	public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+		ServerHttpRequest originalRequest = exchange.getRequest();
+		String path = originalRequest.getURI().getPath();
+
+		// Skip filter for binary content
+		if (/* path.contains("/getTokens") || path.contains("/refreshToken") || */
+		isBinaryContent(originalRequest.getHeaders())) {
+			log.debug("Skipping CryptoGlobalFilter for path: {}", path);
+			return chain.filter(exchange);
+		}
+
+		// Decrypt headers
+		HttpHeaders decryptedHeaders = new HttpHeaders();
+		originalRequest.getHeaders().forEach((key, values) -> {
+			decryptedHeaders.put(key, values.stream().map(this::safeHeaderDecrypt).toList());
+		});
+
+		// Decrypt and decode query params
+		MultiValueMap<String, String> decryptedQueryParams = new LinkedMultiValueMap<>();
+		originalRequest.getQueryParams().forEach((key, values) -> {
+			List<String> decryptedValues = values.stream().map(t -> {
+				try {
+					return AESCryptoUtils.decrypt(t);
+				} catch (GeneralSecurityException e) {
+					throw new RuntimeException(e);
+				}
+			}).map(this::urlDecode).toList();
+			decryptedQueryParams.put(key, decryptedValues);
+		});
+
+		// Build new URI with decoded params
+		URI newUri = buildNewUri(originalRequest, decryptedQueryParams);
+
+		// Decrypt body safely
+		return DataBufferUtils.join(originalRequest.getBody())
+				.defaultIfEmpty(new DefaultDataBufferFactory().wrap(new byte[0])).flatMap(dataBuffer -> {
+					if (dataBuffer.readableByteCount() > MAX_BODY_SIZE) {
+						log.error("Request body exceeds max size limit");
+						// return sendErrorResponse(exchange, "Payload too large");
+						return Mono.error(new IllegalStateException("Payload too large"));
+					}
+
+					byte[] bytes = new byte[dataBuffer.readableByteCount()];
+					dataBuffer.read(bytes);
+					DataBufferUtils.release(dataBuffer);
+
+					String encryptedBody = new String(bytes, StandardCharsets.UTF_8);
+					String decryptedBody;
+					try {
+						decryptedBody = AESCryptoUtils.decrypt(encryptedBody);
+					} catch (GeneralSecurityException e) {
+						throw new RuntimeException(e);
+					}
+					byte[] decryptedBytes = decryptedBody.getBytes(StandardCharsets.UTF_8);
+					DataBuffer buffer = new DefaultDataBufferFactory().wrap(decryptedBytes);
+
+					// Mutate request with decrypted body and new URI
+					ServerHttpRequest mutatedRequest = new ServerHttpRequestDecorator(originalRequest) {
+						@Override
+						public URI getURI() {
+							return newUri;
+						}
+
+						@Override
+						public Flux<DataBuffer> getBody() {
+							return Flux.just(buffer);
+						}
+
+						@Override
+						public HttpHeaders getHeaders() {
+							HttpHeaders headers = new HttpHeaders();
+							headers.putAll(decryptedHeaders);
+							headers.setContentLength(decryptedBytes.length);
+							MediaType originalContentType = originalRequest.getHeaders().getContentType();
+							if (originalContentType != null) {
+								headers.setContentType(originalContentType);
+							} else {
+								headers.setContentType(MediaType.APPLICATION_JSON);
+							}
+							return headers;
+						}
+					};
+
+					return chain.filter(exchange.mutate().request(mutatedRequest).build());
+				}).onErrorResume(e -> {
+					log.error("CryptoRequestFilter failed: {}", e.getMessage(), e);
+
+					HttpStatus status = HttpStatus.INTERNAL_SERVER_ERROR;
+
+					Throwable cause = e instanceof RuntimeException && e.getCause() != null ? e.getCause() : e;
+					String message = cause.getMessage();
+
+					if (cause instanceof IllegalStateException && e.getMessage().contains("Payload too large")) {
+						status = HttpStatus.PAYLOAD_TOO_LARGE;
+						message = "Request body exceeds allowed size";
+					} else if (cause instanceof URISyntaxException) {
+						status = HttpStatus.BAD_REQUEST;
+						message = "Invalid URI format";
+
+					} else if (cause instanceof IllegalArgumentException || cause instanceof GeneralSecurityException) {
+						status = HttpStatus.BAD_REQUEST;
+						message = "Invalid request : " + e.getMessage();
+					} else {
+						return Mono.error(e);
+					}
+
+					exchange.getResponse().setStatusCode(status);
+					exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+					String errorJson = String.format("{\"status\":\"error\",\"message\":\"%s\"}", message);
+					DataBuffer buffer = new DefaultDataBufferFactory().wrap(errorJson.getBytes(StandardCharsets.UTF_8));
+					return exchange.getResponse().writeWith(Mono.just(buffer));
+				});
+
+//		 return DataBufferUtils.join(originalRequest.getBody())
+//	                .defaultIfEmpty(new DefaultDataBufferFactory().wrap(new byte[0]))
+//	                .flatMap(dataBuffer -> {
+//	                    if (dataBuffer.readableByteCount() > MAX_BODY_SIZE) {
+//	                        return sendErrorResponse(exchange, "Payload too large");
+//	                    }
+//
+//	                    byte[] bytes = new byte[dataBuffer.readableByteCount()];
+//	                    dataBuffer.read(bytes);
+//	                    DataBufferUtils.release(dataBuffer);
+//
+//	                    String decryptedBody = safeDecrypt(new String(bytes, StandardCharsets.UTF_8));
+//	                    byte[] decryptedBytes = decryptedBody.getBytes(StandardCharsets.UTF_8);
+//	                    DataBuffer buffer = new DefaultDataBufferFactory().wrap(decryptedBytes);
+//
+//	                    ServerHttpRequest mutatedRequest = new ServerHttpRequestDecorator(originalRequest) {
+//	                        @Override
+//	                        public URI getURI() {
+//	                            return newUri;
+//	                        }
+//
+//	                        @Override
+//	                        public Flux<DataBuffer> getBody() {
+//	                            return Flux.just(buffer);
+//	                        }
+//
+//	                        @Override
+//	                        public HttpHeaders getHeaders() {
+//	                            HttpHeaders headers = new HttpHeaders();
+//	                            headers.putAll(decryptedHeaders);
+//	                            headers.setContentLength(decryptedBytes.length);
+//	                            headers.setContentType(originalRequest.getHeaders().getContentType() != null
+//	                                    ? originalRequest.getHeaders().getContentType()
+//	                                    : MediaType.APPLICATION_JSON);
+//	                            return headers;
+//	                        }
+//	                    };
+//
+//	                    return chain.filter(exchange.mutate().request(mutatedRequest).build());
+//	                })
+//	                .onErrorResume(e -> {
+//	                    log.error("Request decryption failed: {}", e.getMessage(), e);
+//	                    return sendErrorResponse(exchange, "Invalid request");
+//	                });
+	}
+
+	private boolean isBinaryContent(HttpHeaders headers) {
+		MediaType contentType = headers.getContentType();
+		return contentType != null && (MediaType.MULTIPART_FORM_DATA.includes(contentType)
+				|| MediaType.APPLICATION_OCTET_STREAM.includes(contentType));
+	}
+
+	private URI buildNewUri(ServerHttpRequest originalRequest, MultiValueMap<String, String> queryParams) {
+		StringBuilder newQuery = new StringBuilder();
+		queryParams.forEach((key, values) -> {
+			for (String value : values) {
+				newQuery.append(key).append("=").append(value).append("&");
+			}
+		});
+		if (newQuery.length() > 0)
+			newQuery.setLength(newQuery.length() - 1);
+
+		try {
+			return new URI(originalRequest.getURI().getScheme(), originalRequest.getURI().getAuthority(),
+					originalRequest.getURI().getPath(), newQuery.toString(), originalRequest.getURI().getFragment());
+		} catch (URISyntaxException e) {
+			log.error("Failed to build URI: {}", e.getMessage());
+			return originalRequest.getURI();
+		}
+	}
+	
+	private String safeHeaderDecrypt(String value) {
+		try {
+			return AESCryptoUtils.decrypt(value);
+		} catch (Exception e) {
+			return value;
+		}
+	}
+
+	private String urlDecode(String value) {
+		try {
+			return URLDecoder.decode(value, StandardCharsets.UTF_8);
+		} catch (Exception e) {
+			throw e;
+		}
+	}
+
+	@Override
+	public int getOrder() {
+		return Ordered.HIGHEST_PRECEDENCE + 10;
+	}
+
+	private Mono<Void> sendErrorResponse(ServerWebExchange exchange, String message) {
+		exchange.getResponse().setStatusCode(HttpStatus.BAD_REQUEST);
+		exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+		String errorJson = "{\"status\":\"error\",\"message\":\"" + message + "\"}";
+		DataBuffer buffer = new DefaultDataBufferFactory().wrap(errorJson.getBytes(StandardCharsets.UTF_8));
+		return exchange.getResponse().writeWith(Mono.just(buffer));
+	}
+}
+package com.indusind.trade.api.gateway.filters;
+
+import java.time.Instant;
+import java.util.Map;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.web.ErrorProperties;
+import org.springframework.boot.autoconfigure.web.WebProperties;
+import org.springframework.boot.autoconfigure.web.reactive.error.DefaultErrorWebExceptionHandler;
+import org.springframework.boot.web.error.ErrorAttributeOptions;
+import org.springframework.boot.web.reactive.error.ErrorAttributes;
+import org.springframework.cloud.gateway.support.NotFoundException;
+import org.springframework.context.ApplicationContext;
+import org.springframework.core.annotation.Order;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.codec.ServerCodecConfigurer;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.server.ServerRequest;
+
+import lombok.extern.slf4j.Slf4j;
+
+@Component
+@Order(-1)
+@Slf4j
+public class GatewayErrorHandler extends DefaultErrorWebExceptionHandler {
+
+    @Autowired
+    public GatewayErrorHandler(ErrorAttributes errorAttributes,
+                               WebProperties.Resources resources,
+                               ErrorProperties errorProperties,
+                               ApplicationContext applicationContext,
+                               ServerCodecConfigurer codecConfigurer) {
+        super(errorAttributes, resources, errorProperties, applicationContext);
+        super.setMessageWriters(codecConfigurer.getWriters());
+        super.setMessageReaders(codecConfigurer.getReaders());
+    }
+
+    @Override
+    protected Map<String, Object> getErrorAttributes(ServerRequest request, ErrorAttributeOptions options) {
+        Throwable error = getError(request);
+        int status = mapStatus(error);
+
+        log.error("Gateway Error [traceId={}]: {}", request.exchange().getRequest().getId(), error.getMessage(), error);
+
+        return Map.of(
+                "type", "https://indusind.trade.com/problem",
+                "title", HttpStatus.valueOf(status).getReasonPhrase(),
+                "status", status,
+                "detail", error.getMessage(),
+                "instance", request.path(),
+                "traceId", request.exchange().getRequest().getId(),
+                "timestamp", Instant.now().toString()
+        );
+    }
+
+    @Override
+    protected int getHttpStatus(Map<String, Object> errorAttributes) {
+        return (int) errorAttributes.get("status");
+    }
+
+    private int mapStatus(Throwable ex) {
+        if (ex instanceof NotFoundException) return HttpStatus.SERVICE_UNAVAILABLE.value();
+        return HttpStatus.INTERNAL_SERVER_ERROR.value();
+    }
+}
+package com.indusind.trade.api.gateway.filters;
+
+import java.nio.charset.StandardCharsets;
+
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.springframework.web.server.ServerWebExchange;
+
+import com.indusind.trade.api.gateway.config.PublicEndpointsConfig;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Mono;
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class JwtAuthenticationGlobalFilter implements GlobalFilter, Ordered {
+
+    private final WebClient.Builder webClientBuilder;
+    private final PublicEndpointsConfig publicEndpointsConfig;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+
+        // Skip JWT validation for public endpoints
+        if (isPublicEndpoint(path)) {
+            log.debug("Public endpoint detected: {}. Skipping JWT validation.", path);
+            return chain.filter(exchange);
+        }
+
+        String authHeader = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            log.error("Missing or invalid Authorization header for path: {}", path);
+            return unauthorizedResponse(exchange, "Missing or invalid Authorization header", HttpStatus.UNAUTHORIZED);
+        }
+
+        String jwt = authHeader.substring(7);
+        WebClient webClient = webClientBuilder.baseUrl("lb://TRADE-AUTH").build();
+
+        // Reactive token validation
+        return webClient.post()
+                .uri("/validateToken")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + jwt)
+                .retrieve()
+                .bodyToMono(Void.class)
+                .doOnSuccess(v -> log.debug("Token validation succeeded for path: {}", path))
+                .then(chain.filter(exchange))
+				.onErrorResume(WebClientResponseException.Unauthorized.class, e -> {
+					log.error("Token validation failed (401) for path: {}. Reason: {}", path, e.getMessage());
+					return unauthorizedResponse(exchange, "Invalid token", HttpStatus.UNAUTHORIZED);
+				}).onErrorResume(WebClientResponseException.class, e -> {
+					if (e.getStatusCode() == HttpStatus.SERVICE_UNAVAILABLE) {
+						log.error("Auth service unavailable error for path: {}. Status: {}, Body: {}", path,
+								e.getStatusCode(), e.getResponseBodyAsString());
+						return unauthorizedResponse(exchange, "Authentication service unavailable",
+								HttpStatus.SERVICE_UNAVAILABLE);
+					}
+					log.error("Auth service returned error for path: {}. Status: {}, Body: {}", path, e.getStatusCode(),
+							e.getResponseBodyAsString());
+					return unauthorizedResponse(exchange, "Authentication service error",
+							HttpStatus.INTERNAL_SERVER_ERROR);
+				}).onErrorResume(Exception.class, e -> {
+					log.error("Unexpected error during token validation for path: {}", path, e);
+					return unauthorizedResponse(exchange, "Internal authentication error",
+							HttpStatus.INTERNAL_SERVER_ERROR);
+				});
+	}
+
+    private boolean isPublicEndpoint(String path) {
+        return publicEndpointsConfig.getPublicEndpoints().stream()
+                .anyMatch(pattern -> pathMatcher.match(pattern, path));
+    }
+
+	private Mono<Void> unauthorizedResponse(ServerWebExchange exchange, String message, HttpStatus status) {
+		exchange.getResponse().setStatusCode(status);
+		exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+		String responseBody = String.format("{\"error\":\"%s\",\"message\":\"%s\"}", status.getReasonPhrase(), message);
+		byte[] bytes = responseBody.getBytes(StandardCharsets.UTF_8);
+
+		return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+	}
+
+	@Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE + 20;
+    }
+}

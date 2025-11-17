@@ -1,0 +1,506 @@
+package com.gateway.filter;
+
+import com.gateway.exception.DecryptionException;
+import com.gateway.service.EncryptionService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
+import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class RequestDecryptionFilter extends AbstractGatewayFilterFactory<RequestDecryptionFilter.Config> {
+
+    private final EncryptionService encryptionService;
+    
+    private static final int MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB limit
+    private static final int MAX_HEADER_SIZE = 8 * 1024; // 8 KB per header
+    private static final int MAX_QUERY_PARAM_SIZE = 2 * 1024; // 2 KB per query param
+
+    public RequestDecryptionFilter() {
+        super(Config.class);
+    }
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            ServerHttpRequest request = exchange.getRequest();
+            String path = request.getPath().toString();
+            HttpMethod method = request.getMethod();
+
+            // Skip decryption for specific paths and binary content
+            if (shouldSkipDecryption(path, method, request.getHeaders())) {
+                log.debug("Skipping decryption for path: {} and method: {}", path, method);
+                return chain.filter(exchange);
+            }
+
+            log.debug("Processing request decryption for path: {}", path);
+
+            try {
+                // Step 1: Decrypt headers with validation
+                HttpHeaders decryptedHeaders = decryptHeaders(request.getHeaders());
+
+                // Step 2: Decrypt and decode query parameters with validation
+                MultiValueMap<String, String> decryptedQueryParams = decryptQueryParams(request.getQueryParams());
+
+                // Step 3: Build new URI with decrypted query params
+                URI newUri = buildNewUri(request, decryptedQueryParams);
+
+                // Step 4: Decrypt body
+                return decryptBody(exchange, request, decryptedHeaders, newUri, chain);
+
+            } catch (DecryptionException e) {
+                log.error("Decryption failed: {}", e.getMessage());
+                return sendErrorResponse(exchange, HttpStatus.BAD_REQUEST, "Decryption failed: " + e.getMessage());
+            } catch (IllegalArgumentException e) {
+                log.error("Invalid request format: {}", e.getMessage());
+                return sendErrorResponse(exchange, HttpStatus.BAD_REQUEST, "Invalid request format: " + e.getMessage());
+            } catch (URISyntaxException e) {
+                log.error("Invalid URI format: {}", e.getMessage());
+                return sendErrorResponse(exchange, HttpStatus.BAD_REQUEST, "Invalid URI format");
+            } catch (Exception e) {
+                log.error("Unexpected error in decryption filter: {}", e.getMessage(), e);
+                return sendErrorResponse(exchange, HttpStatus.INTERNAL_SERVER_ERROR, "Request processing failed");
+            }
+        };
+    }
+
+    /**
+     * Decrypt request body with size validation
+     */
+    private Mono<Void> decryptBody(ServerWebExchange exchange, ServerHttpRequest request,
+                                     HttpHeaders decryptedHeaders, URI newUri, 
+                                     GatewayFilterChain chain) {
+        
+        return DataBufferUtils.join(request.getBody())
+            .defaultIfEmpty(new DefaultDataBufferFactory().wrap(new byte[0]))
+            .flatMap(dataBuffer -> {
+                try {
+                    // Validate body size
+                    if (dataBuffer.readableByteCount() > MAX_BODY_SIZE) {
+                        log.error("Request body exceeds max size limit: {} bytes", dataBuffer.readableByteCount());
+                        DataBufferUtils.release(dataBuffer);
+                        return sendErrorResponse(exchange, HttpStatus.PAYLOAD_TOO_LARGE, 
+                            "Request body exceeds maximum allowed size of " + (MAX_BODY_SIZE / 1024 / 1024) + " MB");
+                    }
+
+                    // Handle empty body
+                    if (dataBuffer.readableByteCount() == 0) {
+                        log.debug("Empty request body, skipping decryption");
+                        DataBufferUtils.release(dataBuffer);
+                        
+                        ServerHttpRequest mutatedRequest = createMutatedRequest(request, decryptedHeaders, 
+                            newUri, Flux.empty(), 0);
+                        return chain.filter(exchange.mutate().request(mutatedRequest).build());
+                    }
+
+                    // Read body content
+                    byte[] bytes = new byte[dataBuffer.readableByteCount()];
+                    dataBuffer.read(bytes);
+                    DataBufferUtils.release(dataBuffer);
+
+                    String encryptedBody = new String(bytes, StandardCharsets.UTF_8);
+                    
+                    // Validate Base64 encoding
+                    if (!encryptionService.isValidBase64(encryptedBody)) {
+                        log.error("Invalid Base64 encoded body");
+                        return sendErrorResponse(exchange, HttpStatus.BAD_REQUEST, 
+                            "Invalid encrypted data format");
+                    }
+
+                    // Decrypt the body
+                    String decryptedBody;
+                    try {
+                        decryptedBody = encryptionService.decrypt(encryptedBody);
+                        log.debug("Request body decrypted successfully, size: {} bytes", decryptedBody.length());
+                    } catch (RuntimeException e) {
+                        log.error("Body decryption failed: {}", e.getMessage());
+                        return sendErrorResponse(exchange, HttpStatus.BAD_REQUEST, 
+                            "Failed to decrypt request body");
+                    }
+
+                    // Validate decrypted content is valid JSON/XML if needed
+                    if (!isValidContent(decryptedBody, decryptedHeaders.getContentType())) {
+                        log.error("Decrypted body contains invalid content");
+                        return sendErrorResponse(exchange, HttpStatus.BAD_REQUEST, 
+                            "Invalid request content after decryption");
+                    }
+
+                    byte[] decryptedBytes = decryptedBody.getBytes(StandardCharsets.UTF_8);
+                    DataBuffer buffer = new DefaultDataBufferFactory().wrap(decryptedBytes);
+
+                    // Create mutated request with decrypted body
+                    ServerHttpRequest mutatedRequest = createMutatedRequest(request, decryptedHeaders, 
+                        newUri, Flux.just(buffer), decryptedBytes.length);
+
+                    return chain.filter(exchange.mutate().request(mutatedRequest).build());
+
+                } catch (Exception e) {
+                    log.error("Error processing request body: {}", e.getMessage(), e);
+                    return sendErrorResponse(exchange, HttpStatus.INTERNAL_SERVER_ERROR, 
+                        "Failed to process request");
+                }
+            })
+            .onErrorResume(e -> {
+                log.error("Error in body decryption: {}", e.getMessage(), e);
+                
+                HttpStatus status = HttpStatus.INTERNAL_SERVER_ERROR;
+                String message = "Request processing failed";
+
+                if (e instanceof IllegalStateException && e.getMessage().contains("Payload too large")) {
+                    status = HttpStatus.PAYLOAD_TOO_LARGE;
+                    message = "Request body exceeds allowed size";
+                } else if (e instanceof URISyntaxException) {
+                    status = HttpStatus.BAD_REQUEST;
+                    message = "Invalid URI format";
+                } else if (e instanceof IllegalArgumentException) {
+                    status = HttpStatus.BAD_REQUEST;
+                    message = "Invalid request format";
+                } else if (e instanceof DecryptionException) {
+                    status = HttpStatus.BAD_REQUEST;
+                    message = "Decryption failed";
+                }
+
+                return sendErrorResponse(exchange, status, message);
+            });
+    }
+
+    /**
+     * Create mutated request with decrypted data
+     */
+    private ServerHttpRequest createMutatedRequest(ServerHttpRequest originalRequest,
+                                                     HttpHeaders decryptedHeaders,
+                                                     URI newUri,
+                                                     Flux<DataBuffer> body,
+                                                     long contentLength) {
+        return new ServerHttpRequestDecorator(originalRequest) {
+            @Override
+            public URI getURI() {
+                return newUri;
+            }
+
+            @Override
+            public Flux<DataBuffer> getBody() {
+                return body;
+            }
+
+            @Override
+            public HttpHeaders getHeaders() {
+                HttpHeaders headers = new HttpHeaders();
+                headers.putAll(decryptedHeaders);
+                
+                if (contentLength > 0) {
+                    headers.setContentLength(contentLength);
+                }
+                
+                // Preserve or set content type
+                MediaType originalContentType = originalRequest.getHeaders().getContentType();
+                if (originalContentType != null) {
+                    headers.setContentType(originalContentType);
+                } else if (contentLength > 0) {
+                    headers.setContentType(MediaType.APPLICATION_JSON);
+                }
+                
+                return headers;
+            }
+        };
+    }
+
+    /**
+     * Decrypt headers with validation
+     */
+    private HttpHeaders decryptHeaders(HttpHeaders originalHeaders) {
+        HttpHeaders decryptedHeaders = new HttpHeaders();
+        
+        originalHeaders.forEach((key, values) -> {
+            try {
+                List<String> decryptedValues = values.stream()
+                    .map(this::safeHeaderDecrypt)
+                    .collect(Collectors.toList());
+                
+                // Validate header size after decryption
+                for (String value : decryptedValues) {
+                    if (value != null && value.length() > MAX_HEADER_SIZE) {
+                        log.warn("Header {} exceeds max size after decryption, truncating", key);
+                        throw new IllegalArgumentException("Header value too large: " + key);
+                    }
+                }
+                
+                decryptedHeaders.put(key, decryptedValues);
+            } catch (Exception e) {
+                log.error("Failed to decrypt header {}: {}", key, e.getMessage());
+                // Keep original value if decryption fails for non-critical headers
+                if (isCriticalHeader(key)) {
+                    throw new DecryptionException("Failed to decrypt critical header: " + key, e);
+                }
+                decryptedHeaders.put(key, values);
+            }
+        });
+        
+        return decryptedHeaders;
+    }
+
+    /**
+     * Decrypt query parameters with validation
+     */
+    private MultiValueMap<String, String> decryptQueryParams(MultiValueMap<String, String> originalParams) {
+        MultiValueMap<String, String> decryptedQueryParams = new LinkedMultiValueMap<>();
+        
+        originalParams.forEach((key, values) -> {
+            try {
+                List<String> decryptedValues = values.stream()
+                    .map(this::safeDecrypt)
+                    .map(this::urlDecode)
+                    .collect(Collectors.toList());
+                
+                // Validate query param size after decryption
+                for (String value : decryptedValues) {
+                    if (value != null && value.length() > MAX_QUERY_PARAM_SIZE) {
+                        log.warn("Query param {} exceeds max size after decryption", key);
+                        throw new IllegalArgumentException("Query parameter value too large: " + key);
+                    }
+                }
+                
+                decryptedQueryParams.put(key, decryptedValues);
+            } catch (Exception e) {
+                log.error("Failed to decrypt query param {}: {}", key, e.getMessage());
+                throw new DecryptionException("Failed to decrypt query parameter: " + key, e);
+            }
+        });
+        
+        return decryptedQueryParams;
+    }
+
+    /**
+     * Build new URI with decrypted query parameters
+     */
+    private URI buildNewUri(ServerHttpRequest originalRequest, 
+                            MultiValueMap<String, String> queryParams) throws URISyntaxException {
+        
+        if (queryParams.isEmpty()) {
+            return originalRequest.getURI();
+        }
+        
+        StringBuilder newQuery = new StringBuilder();
+        queryParams.forEach((key, values) -> {
+            for (String value : values) {
+                if (newQuery.length() > 0) {
+                    newQuery.append("&");
+                }
+                newQuery.append(key).append("=").append(value);
+            }
+        });
+
+        try {
+            URI originalUri = originalRequest.getURI();
+            return new URI(
+                originalUri.getScheme(),
+                originalUri.getAuthority(),
+                originalUri.getPath(),
+                newQuery.length() > 0 ? newQuery.toString() : null,
+                originalUri.getFragment()
+            );
+        } catch (URISyntaxException e) {
+            log.error("Failed to build URI: {}", e.getMessage());
+            throw e;
+        }
+    }
+
+    /**
+     * Safely decrypt header value, return original if decryption fails
+     */
+    private String safeHeaderDecrypt(String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        
+        try {
+            // Check if value looks like encrypted data (Base64)
+            if (encryptionService.isValidBase64(value)) {
+                return encryptionService.decrypt(value);
+            }
+            return value;
+        } catch (Exception e) {
+            log.debug("Header decryption failed, using original value: {}", e.getMessage());
+            return value;
+        }
+    }
+
+    /**
+     * Safely decrypt value with error handling
+     */
+    private String safeDecrypt(String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        
+        try {
+            return encryptionService.decrypt(value);
+        } catch (Exception e) {
+            log.error("Decryption failed for value: {}", e.getMessage());
+            throw new DecryptionException("Decryption failed", e);
+        }
+    }
+
+    /**
+     * URL decode with error handling
+     */
+    private String urlDecode(String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.error("URL decoding failed: {}", e.getMessage());
+            return value;
+        }
+    }
+
+    /**
+     * Validate if content is valid based on content type
+     */
+    private boolean isValidContent(String content, MediaType contentType) {
+        if (content == null || content.isEmpty()) {
+            return true;
+        }
+        
+        try {
+            if (contentType != null) {
+                if (MediaType.APPLICATION_JSON.includes(contentType)) {
+                    // Basic JSON validation
+                    content = content.trim();
+                    return (content.startsWith("{") && content.endsWith("}")) ||
+                           (content.startsWith("[") && content.endsWith("]"));
+                } else if (MediaType.APPLICATION_XML.includes(contentType)) {
+                    // Basic XML validation
+                    content = content.trim();
+                    return content.startsWith("<") && content.endsWith(">");
+                }
+            }
+            return true; // Allow other content types
+        } catch (Exception e) {
+            log.error("Content validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Check if decryption should be skipped
+     */
+    private boolean shouldSkipDecryption(String path, HttpMethod method, HttpHeaders headers) {
+        // Skip for specific paths (customize as needed)
+        if (path.contains("/getTokens") || 
+            path.contains("/refreshToken") ||
+            path.contains("/health") ||
+            path.contains("/actuator")) {
+            return true;
+        }
+        
+        // Skip for binary content
+        if (isBinaryContent(headers)) {
+            return true;
+        }
+        
+        // Skip for GET and DELETE requests (usually no body)
+        if (HttpMethod.GET.equals(method) || HttpMethod.DELETE.equals(method)) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Check if content is binary
+     */
+    private boolean isBinaryContent(HttpHeaders headers) {
+        MediaType contentType = headers.getContentType();
+        
+        if (contentType == null) {
+            return false;
+        }
+        
+        return MediaType.MULTIPART_FORM_DATA.includes(contentType) ||
+               MediaType.APPLICATION_OCTET_STREAM.includes(contentType) ||
+               contentType.toString().contains("image/") ||
+               contentType.toString().contains("video/") ||
+               contentType.toString().contains("audio/") ||
+               contentType.toString().contains("application/pdf");
+    }
+
+    /**
+     * Check if header is critical and must be decrypted
+     */
+    private boolean isCriticalHeader(String headerName) {
+        return "Authorization".equalsIgnoreCase(headerName) ||
+               "X-API-Key".equalsIgnoreCase(headerName) ||
+               "X-Auth-Token".equalsIgnoreCase(headerName);
+    }
+
+    /**
+     * Send error response
+     */
+    private Mono<Void> sendErrorResponse(ServerWebExchange exchange, HttpStatus status, String message) {
+        exchange.getResponse().setStatusCode(status);
+        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        
+        String errorJson = String.format(
+            "{\"status\":\"error\",\"code\":%d,\"message\":\"%s\",\"timestamp\":\"%s\"}",
+            status.value(),
+            message.replace("\"", "\\\""),
+            java.time.Instant.now().toString()
+        );
+        
+        DataBuffer buffer = new DefaultDataBufferFactory()
+            .wrap(errorJson.getBytes(StandardCharsets.UTF_8));
+        
+        return exchange.getResponse().writeWith(Mono.just(buffer))
+            .doOnError(error -> log.error("Error writing response: {}", error.getMessage()));
+    }
+
+    public static class Config {
+        // Configuration properties if needed
+        private boolean strictMode = false;
+        private int maxBodySize = MAX_BODY_SIZE;
+        
+        public boolean isStrictMode() {
+            return strictMode;
+        }
+        
+        public void setStrictMode(boolean strictMode) {
+            this.strictMode = strictMode;
+        }
+        
+        public int getMaxBodySize() {
+            return maxBodySize;
+        }
+        
+        public void setMaxBodySize(int maxBodySize) {
+            this.maxBodySize = maxBodySize;
+        }
+    }
+}

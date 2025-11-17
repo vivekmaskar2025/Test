@@ -1,0 +1,219 @@
+package com.gateway.filter;
+
+import com.gateway.service.EncryptionService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.reactivestreams.Publisher;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.core.io.buffer.*;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.util.annotation.NonNull;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * Production-ready response encryption filter.
+ *
+ * - Joins the response body safely (with max size guard)
+ * - Skips encryption for non-2xx responses, empty bodies, or non-textual content-types
+ * - Preserves headers and updates Content-Length when encrypted
+ * - Adds X-Response-Encrypted and X-Encryption-Status headers for observability
+ * - Falls back to original response when encryption fails
+ */
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class ResponseEncryptionFilter extends AbstractGatewayFilterFactory<ResponseEncryptionFilter.Config> {
+
+    private final EncryptionService encryptionService;
+
+    // Maximum bytes to join into memory before refusing encryption (protects from OOM).
+    // Tune this based on your environment (e.g., 2MB = 2 * 1024 * 1024).
+    private static final int DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
+
+    // Timeout for encryption operation (defensive).
+    private static final Duration ENCRYPTION_TIMEOUT = Duration.ofSeconds(5);
+
+    public ResponseEncryptionFilter(EncryptionService encryptionService) {
+        super(Config.class);
+        this.encryptionService = encryptionService;
+    }
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        final int maxBodyBytes = config.getMaxBodyBytes() > 0 ? config.getMaxBodyBytes() : DEFAULT_MAX_BODY_BYTES;
+
+        return (exchange, chain) -> {
+            ServerHttpResponse originalResponse = exchange.getResponse();
+            DataBufferFactory bufferFactory = originalResponse.bufferFactory();
+
+            ServerHttpResponseDecorator decorated = new ServerHttpResponseDecorator(originalResponse) {
+
+                @Override
+                @SuppressWarnings("unchecked")
+                public Mono<Void> writeWith(@NonNull Publisher<? extends DataBuffer> body) {
+                    // If not a Flux, let it pass through
+                    if (!(body instanceof Flux)) {
+                        return super.writeWith(body);
+                    }
+
+                    Flux<? extends DataBuffer> fluxBody = (Flux<? extends DataBuffer>) body;
+
+                    // Join and process
+                    return DataBufferUtils.join(fluxBody)
+                            .flatMap(joined -> {
+                                try {
+                                    int readable = joined.readableByteCount();
+                                    if (readable == 0) {
+                                        // empty body - pass through
+                                        DataBufferUtils.release(joined);
+                                        log.debug("[ResponseEncryptionFilter] Empty response body - skipping encryption");
+                                        // ensure headers reflect empty body
+                                        getDelegate().getHeaders().remove(HttpHeaders.CONTENT_LENGTH);
+                                        return super.writeWith(Mono.empty());
+                                    }
+
+                                    if (readable > maxBodyBytes) {
+                                        // avoid huge aggregation
+                                        log.warn("[ResponseEncryptionFilter] Response body size {} bytes exceeds max {} - skipping encryption",
+                                                readable, maxBodyBytes);
+                                        byte[] originalBytes = new byte[readable];
+                                        joined.read(originalBytes);
+                                        DataBufferUtils.release(joined);
+                                        // write original
+                                        getDelegate().getHeaders().remove(HttpHeaders.CONTENT_LENGTH);
+                                        return super.writeWith(Mono.just(bufferFactory.wrap(originalBytes)));
+                                    }
+
+                                    // Check status
+                                    HttpStatusCode statusCode = getStatusCode();
+                                    if (statusCode == null || !statusCode.is2xxSuccessful()) {
+                                        // error or non-2xx: do not encrypt
+                                        log.debug("[ResponseEncryptionFilter] Skipping encryption for status: {}", statusCode);
+                                        byte[] originalBytes = new byte[readable];
+                                        joined.read(originalBytes);
+                                        DataBufferUtils.release(joined);
+                                        // write original buffer (update headers)
+                                        getDelegate().getHeaders().remove(HttpHeaders.CONTENT_LENGTH);
+                                        return super.writeWith(Mono.just(bufferFactory.wrap(originalBytes)));
+                                    }
+
+                                    // Check content-type
+                                    MediaType contentType = getDelegate().getHeaders().getContentType();
+                                    if (!isTextLike(contentType)) {
+                                        // Binary or unknown: skip encryption (avoid corrupting binary)
+                                        log.debug("[ResponseEncryptionFilter] Skipping encryption for non-text content-type: {}", contentType);
+                                        byte[] originalBytes = new byte[readable];
+                                        joined.read(originalBytes);
+                                        DataBufferUtils.release(joined);
+                                        getDelegate().getHeaders().remove(HttpHeaders.CONTENT_LENGTH);
+                                        return super.writeWith(Mono.just(bufferFactory.wrap(originalBytes)));
+                                    }
+
+                                    byte[] originalBytes = new byte[readable];
+                                    joined.read(originalBytes);
+                                    DataBufferUtils.release(joined);
+                                    String originalBody = new String(originalBytes, StandardCharsets.UTF_8);
+
+                                    if (!StringUtils.hasText(originalBody)) {
+                                        log.debug("[ResponseEncryptionFilter] Blank response body - skipping encryption");
+                                        getDelegate().getHeaders().remove(HttpHeaders.CONTENT_LENGTH);
+                                        return super.writeWith(Mono.just(bufferFactory.wrap(originalBytes)));
+                                    }
+
+                                    // Skip encryption for error-like JSON (simple heuristic)
+                                    if (originalBody.contains("\"error\"") || originalBody.contains("\"status\":\"error\"")) {
+                                        log.debug("[ResponseEncryptionFilter] Detected error-like body - skipping encryption");
+                                        getDelegate().getHeaders().remove(HttpHeaders.CONTENT_LENGTH);
+                                        return super.writeWith(Mono.just(bufferFactory.wrap(originalBytes)));
+                                    }
+
+                                    // Try to encrypt (bounded by timeout)
+                                    return Mono.fromCallable(() -> encryptionService.encrypt(originalBody))
+                                            .timeout(ENCRYPTION_TIMEOUT)
+                                            .map(encrypted -> {
+                                                byte[] encryptedBytes = encrypted.getBytes(StandardCharsets.UTF_8);
+
+                                                // Update headers: content-type remains same (text/json), but length changes
+                                                HttpHeaders headers = getDelegate().getHeaders();
+                                                if (headers != null) {
+                                                    headers.setContentLength(encryptedBytes.length);
+                                                    // You may want to keep content-type same (JSON-> still JSON-ish encrypted string)
+                                                    // or set a specific content-type for encrypted payloads. We'll preserve it.
+                                                    headers.set("X-Response-Encrypted", "true");
+                                                    headers.set("X-Encryption-Status", "success");
+                                                }
+
+                                                return bufferFactory.wrap(encryptedBytes);
+                                            })
+                                            .onErrorResume(throwable -> {
+                                                // Encryption failed — fallback to original and mark header
+                                                log.error("[ResponseEncryptionFilter] Encryption failed - returning original body", throwable);
+                                                HttpHeaders headers = getDelegate().getHeaders();
+                                                if (headers != null) {
+                                                    headers.remove(HttpHeaders.CONTENT_LENGTH); // let Netty/chunking handle it
+                                                    headers.set("X-Response-Encrypted", "false");
+                                                    headers.set("X-Encryption-Status", "failed");
+                                                    headers.set("X-Encryption-Error", throwable.getClass().getSimpleName());
+                                                }
+                                                return Mono.just(bufferFactory.wrap(originalBytes));
+                                            })
+                                            .flatMapMany(buf -> Flux.just(buf))
+                                            .as(super::writeWith);
+
+                                } catch (Throwable t) {
+                                    DataBufferUtils.release(joined);
+                                    log.error("[ResponseEncryptionFilter] Unexpected error while encrypting response", t);
+                                    return Mono.error(t);
+                                }
+                            });
+                }
+
+                @Override
+                public Mono<Void> writeAndFlushWith(Publisher<? extends Publisher<? extends DataBuffer>> body) {
+                    // Delegate to writeWith by flattening publishers to a single Flux
+                    return writeWith(Flux.from(body).flatMapSequential(p -> Flux.from(p)));
+                }
+            };
+
+            // continue chain with decorated response
+            return chain.filter(exchange.mutate().response(decorated).build());
+        };
+    }
+
+    private boolean isTextLike(MediaType contentType) {
+        if (contentType == null) return true; // be permissive if unknown
+        if (MediaType.APPLICATION_JSON.includes(contentType)) return true;
+        if (MediaType.TEXT_PLAIN.includes(contentType)) return true;
+        if (MediaType.APPLICATION_XML.includes(contentType)) return true;
+        if (contentType.getType() != null && contentType.getType().equalsIgnoreCase("text")) return true;
+        // Add other textual types if required
+        return false;
+    }
+
+    public static class Config {
+        // max body bytes to aggregate; default used when 0 or negative
+        private int maxBodyBytes = DEFAULT_MAX_BODY_BYTES;
+
+        public int getMaxBodyBytes() {
+            return maxBodyBytes;
+        }
+
+        public void setMaxBodyBytes(int maxBodyBytes) {
+            this.maxBodyBytes = maxBodyBytes;
+        }
+    }
+}

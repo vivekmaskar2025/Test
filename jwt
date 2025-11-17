@@ -1,0 +1,621 @@
+package com.gateway.filter;
+
+import com.gateway.config.PublicEndpointsConfig;
+import com.gateway.exception.UnauthorizedException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * Enhanced JWT Authentication Filter with comprehensive error handling
+ * and production-ready features
+ */
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends AbstractGatewayFilterFactory<JwtAuthenticationFilter.Config> {
+
+    private final WebClient.Builder webClientBuilder;
+    private final PublicEndpointsConfig publicEndpointsConfig;
+    
+    @Value("${jwt.auth-service-url:lb://AUTH-SERVICE}")
+    private String authServiceUrl;
+    
+    @Value("${jwt.validation-endpoint:/validate}")
+    private String validationEndpoint;
+    
+    @Value("${jwt.timeout:5}")
+    private int timeoutSeconds;
+    
+    @Value("${jwt.retry-attempts:2}")
+    private int retryAttempts;
+    
+    @Value("${jwt.retry-delay-ms:100}")
+    private long retryDelayMs;
+
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+    
+    // Cache for token validation results (optional - implement with Redis in production)
+    // private final Map<String, ValidationResult> tokenCache = new ConcurrentHashMap<>();
+    
+    private static final String BEARER_PREFIX = "Bearer ";
+    private static final int MAX_TOKEN_LENGTH = 2048; // JWT tokens shouldn't exceed this
+    private static final int MIN_TOKEN_LENGTH = 20; // Minimum reasonable JWT length
+
+    public JwtAuthenticationFilter() {
+        super(Config.class);
+    }
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            String path = exchange.getRequest().getPath().toString();
+            String method = exchange.getRequest().getMethod().toString();
+
+            log.debug("Processing JWT authentication for path: {} [{}]", path, method);
+
+            // Step 1: Check if endpoint is public
+            if (isPublicEndpoint(path)) {
+                log.debug("Public endpoint detected: {}. Skipping JWT validation.", path);
+                return chain.filter(exchange);
+            }
+
+            // Step 2: Extract and validate Authorization header
+            String authHeader = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+            
+            if (authHeader == null || authHeader.isEmpty()) {
+                log.error("Missing Authorization header for path: {}", path);
+                return sendErrorResponse(exchange, HttpStatus.UNAUTHORIZED, 
+                    "Missing Authorization header", "MISSING_AUTH_HEADER");
+            }
+
+            if (!authHeader.startsWith(BEARER_PREFIX)) {
+                log.error("Invalid Authorization header format for path: {}. Header: {}", 
+                    path, maskToken(authHeader));
+                return sendErrorResponse(exchange, HttpStatus.UNAUTHORIZED, 
+                    "Invalid Authorization header format. Expected: Bearer <token>", 
+                    "INVALID_AUTH_HEADER_FORMAT");
+            }
+
+            // Step 3: Extract and validate JWT token
+            String token = authHeader.substring(BEARER_PREFIX.length()).trim();
+            
+            if (!isValidTokenFormat(token)) {
+                log.error("Invalid JWT token format for path: {}", path);
+                return sendErrorResponse(exchange, HttpStatus.UNAUTHORIZED, 
+                    "Invalid JWT token format", "INVALID_TOKEN_FORMAT");
+            }
+
+            log.debug("Validating JWT token for path: {} (token length: {})", path, token.length());
+
+            // Step 4: Validate token with Auth Service
+            return validateToken(token, path, exchange)
+                .flatMap(validationResponse -> {
+                    log.debug("Token validation succeeded for path: {}. User: {}, Role: {}", 
+                        path, validationResponse.getUsername(), validationResponse.getRole());
+                    
+                    // Step 5: Add user context to request headers
+                    ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
+                        .header("X-User-Name", validationResponse.getUsername())
+                        .header("X-User-Role", validationResponse.getRole())
+                        .header("X-User-Id", validationResponse.getUserId())
+                        .header("X-Auth-Time", String.valueOf(System.currentTimeMillis()))
+                        .build();
+                    
+                    return chain.filter(exchange.mutate().request(modifiedRequest).build());
+                })
+                .onErrorResume(e -> handleValidationError(e, exchange, path));
+        };
+    }
+
+    /**
+     * Validate token with Auth Service
+     */
+    private Mono<TokenValidationResponse> validateToken(String token, String path, ServerWebExchange exchange) {
+        WebClient webClient = webClientBuilder
+            .baseUrl(authServiceUrl)
+            .build();
+
+        return webClient.post()
+            .uri(validationEndpoint)
+            .header(HttpHeaders.AUTHORIZATION, BEARER_PREFIX + token)
+            .header("X-Request-Path", path)
+            .header("X-Request-Id", exchange.getRequest().getId())
+            .retrieve()
+            .onStatus(
+                status -> status.equals(HttpStatus.UNAUTHORIZED),
+                response -> {
+                    log.error("Auth service returned UNAUTHORIZED for path: {}", path);
+                    return response.bodyToMono(String.class)
+                        .flatMap(body -> Mono.error(
+                            new UnauthorizedException("Token validation failed: " + body)
+                        ))
+                        .switchIfEmpty(Mono.error(
+                            new UnauthorizedException("Token is invalid or expired")
+                        ));
+                }
+            )
+            .onStatus(
+                HttpStatus::is4xxClientError,
+                response -> {
+                    log.error("Auth service returned 4xx error for path: {}. Status: {}", 
+                        path, response.statusCode());
+                    return response.bodyToMono(String.class)
+                        .flatMap(body -> Mono.error(
+                            new RuntimeException("Client error: " + body)
+                        ))
+                        .switchIfEmpty(Mono.error(
+                            new RuntimeException("Client error from auth service")
+                        ));
+                }
+            )
+            .onStatus(
+                HttpStatus::is5xxServerError,
+                response -> {
+                    log.error("Auth service returned 5xx error for path: {}. Status: {}", 
+                        path, response.statusCode());
+                    return response.bodyToMono(String.class)
+                        .flatMap(body -> Mono.error(
+                            new RuntimeException("Auth service error: " + body)
+                        ))
+                        .switchIfEmpty(Mono.error(
+                            new RuntimeException("Auth service internal error")
+                        ));
+                }
+            )
+            .bodyToMono(TokenValidationResponse.class)
+            .timeout(Duration.ofSeconds(timeoutSeconds))
+            .retryWhen(Retry.fixedDelay(retryAttempts, Duration.ofMillis(retryDelayMs))
+                .filter(throwable -> 
+                    throwable instanceof WebClientRequestException ||
+                    throwable instanceof TimeoutException
+                )
+                .doBeforeRetry(retrySignal -> 
+                    log.warn("Retrying token validation for path: {}. Attempt: {}", 
+                        path, retrySignal.totalRetries() + 1)
+                )
+            )
+            .doOnError(WebClientResponseException.class, e -> {
+                log.error("Auth service call failed for path: {}. Status: {}, Body: {}", 
+                    path, e.getStatusCode(), e.getResponseBodyAsString());
+            })
+            .doOnError(WebClientRequestException.class, e -> {
+                log.error("Auth service connection failed for path: {}. Error: {}", 
+                    path, e.getMessage());
+            })
+            .doOnError(TimeoutException.class, e -> {
+                log.error("Auth service timeout for path: {} after {} seconds", 
+                    path, timeoutSeconds);
+            });
+    }
+
+    /**
+     * Handle validation errors with specific error responses
+     */
+    private Mono<Void> handleValidationError(Throwable error, ServerWebExchange exchange, String path) {
+        log.error("Token validation error for path: {}. Error type: {}, Message: {}", 
+            path, error.getClass().getSimpleName(), error.getMessage());
+
+        // Unauthorized - Invalid or expired token
+        if (error instanceof UnauthorizedException) {
+            return sendErrorResponse(exchange, HttpStatus.UNAUTHORIZED, 
+                error.getMessage(), "INVALID_TOKEN");
+        }
+
+        // WebClient 401 Unauthorized
+        if (error instanceof WebClientResponseException.Unauthorized) {
+            WebClientResponseException.Unauthorized ex = (WebClientResponseException.Unauthorized) error;
+            return sendErrorResponse(exchange, HttpStatus.UNAUTHORIZED, 
+                "Invalid or expired token", "TOKEN_VALIDATION_FAILED",
+                ex.getResponseBodyAsString());
+        }
+
+        // WebClient 403 Forbidden
+        if (error instanceof WebClientResponseException.Forbidden) {
+            return sendErrorResponse(exchange, HttpStatus.FORBIDDEN, 
+                "Access denied", "ACCESS_DENIED");
+        }
+
+        // WebClient 503 Service Unavailable
+        if (error instanceof WebClientResponseException.ServiceUnavailable) {
+            return sendErrorResponse(exchange, HttpStatus.SERVICE_UNAVAILABLE, 
+                "Authentication service is temporarily unavailable", 
+                "AUTH_SERVICE_UNAVAILABLE");
+        }
+
+        // WebClient other 4xx errors
+        if (error instanceof WebClientResponseException) {
+            WebClientResponseException ex = (WebClientResponseException) error;
+            HttpStatus status = HttpStatus.valueOf(ex.getStatusCode().value());
+            
+            if (status.is4xxClientError()) {
+                return sendErrorResponse(exchange, status, 
+                    "Authentication failed", "AUTH_CLIENT_ERROR",
+                    ex.getResponseBodyAsString());
+            }
+            
+            if (status.is5xxServerError()) {
+                return sendErrorResponse(exchange, HttpStatus.SERVICE_UNAVAILABLE, 
+                    "Authentication service error", "AUTH_SERVICE_ERROR");
+            }
+        }
+
+        // Connection errors
+        if (error instanceof WebClientRequestException) {
+            return sendErrorResponse(exchange, HttpStatus.SERVICE_UNAVAILABLE, 
+                "Cannot connect to authentication service", "AUTH_SERVICE_CONNECTION_ERROR");
+        }
+
+        // Timeout errors
+        if (error instanceof TimeoutException) {
+            return sendErrorResponse(exchange, HttpStatus.GATEWAY_TIMEOUT, 
+                "Authentication service timeout", "AUTH_SERVICE_TIMEOUT");
+        }
+
+        // Generic errors
+        return sendErrorResponse(exchange, HttpStatus.INTERNAL_SERVER_ERROR, 
+            "Internal authentication error", "INTERNAL_AUTH_ERROR");
+    }
+
+    /**
+     * Check if endpoint is public (no authentication required)
+     */
+    private boolean isPublicEndpoint(String path) {
+        if (publicEndpointsConfig == null || publicEndpointsConfig.getPublicEndpoints() == null) {
+            log.warn("Public endpoints configuration is not available");
+            return false;
+        }
+
+        boolean isPublic = publicEndpointsConfig.getPublicEndpoints().stream()
+            .anyMatch(pattern -> {
+                boolean matches = pathMatcher.match(pattern, path);
+                if (matches) {
+                    log.debug("Path {} matches public pattern: {}", path, pattern);
+                }
+                return matches;
+            });
+
+        return isPublic;
+    }
+
+    /**
+     * Validate JWT token format
+     */
+    private boolean isValidTokenFormat(String token) {
+        if (token == null || token.isEmpty()) {
+            return false;
+        }
+
+        // Check token length
+        if (token.length() < MIN_TOKEN_LENGTH || token.length() > MAX_TOKEN_LENGTH) {
+            log.error("Invalid token length: {}. Expected: {}-{}", 
+                token.length(), MIN_TOKEN_LENGTH, MAX_TOKEN_LENGTH);
+            return false;
+        }
+
+        // Basic JWT structure check (header.payload.signature)
+        String[] parts = token.split("\\.");
+        if (parts.length != 3) {
+            log.error("Invalid JWT structure. Expected 3 parts, found: {}", parts.length);
+            return false;
+        }
+
+        // Check if parts are not empty
+        for (String part : parts) {
+            if (part == null || part.isEmpty()) {
+                log.error("JWT contains empty part");
+                return false;
+            }
+        }
+
+        // Check for valid Base64 URL characters
+        if (!token.matches("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$")) {
+            log.error("JWT contains invalid characters");
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Mask token for logging (security)
+     */
+    private String maskToken(String token) {
+        if (token == null || token.length() < 10) {
+            return "***";
+        }
+        return token.substring(0, 10) + "..." + token.substring(token.length() - 10);
+    }
+
+    /**
+     * Send error response with detailed information
+     */
+    private Mono<Void> sendErrorResponse(ServerWebExchange exchange, HttpStatus status, 
+                                          String message, String errorCode) {
+        return sendErrorResponse(exchange, status, message, errorCode, null);
+    }
+
+    /**
+     * Send error response with optional details
+     */
+    private Mono<Void> sendErrorResponse(ServerWebExchange exchange, HttpStatus status, 
+                                          String message, String errorCode, String details) {
+        exchange.getResponse().setStatusCode(status);
+        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+
+        Map<String, Object> errorResponse = new HashMap<>();
+        errorResponse.put("status", "error");
+        errorResponse.put("code", status.value());
+        errorResponse.put("error", status.getReasonPhrase());
+        errorResponse.put("message", message);
+        errorResponse.put("errorCode", errorCode);
+        errorResponse.put("path", exchange.getRequest().getPath().toString());
+        errorResponse.put("timestamp", java.time.Instant.now().toString());
+        
+        if (details != null && !details.isEmpty()) {
+            errorResponse.put("details", details);
+        }
+
+        String responseBody = toJson(errorResponse);
+        byte[] bytes = responseBody.getBytes(StandardCharsets.UTF_8);
+
+        return exchange.getResponse()
+            .writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)))
+            .doOnError(error -> log.error("Error writing response: {}", error.getMessage()));
+    }
+
+    /**
+     * Convert map to JSON string (simple implementation)
+     */
+    private String toJson(Map<String, Object> map) {
+        StringBuilder json = new StringBuilder("{");
+        
+        map.forEach((key, value) -> {
+            if (json.length() > 1) {
+                json.append(",");
+            }
+            json.append("\"").append(key).append("\":");
+            
+            if (value instanceof String) {
+                json.append("\"").append(escapeJson((String) value)).append("\"");
+            } else if (value instanceof Number) {
+                json.append(value);
+            } else {
+                json.append("\"").append(value).append("\"");
+            }
+        });
+        
+        json.append("}");
+        return json.toString();
+    }
+
+    /**
+     * Escape special characters in JSON strings
+     */
+    private String escapeJson(String str) {
+        return str.replace("\\", "\\\\")
+                  .replace("\"", "\\\"")
+                  .replace("\n", "\\n")
+                  .replace("\r", "\\r")
+                  .replace("\t", "\\t");
+    }
+
+    public static class Config {
+        private boolean strictMode = true;
+        private boolean cacheEnabled = false;
+        private int cacheTTLSeconds = 300;
+
+        public boolean isStrictMode() {
+            return strictMode;
+        }
+
+        public void setStrictMode(boolean strictMode) {
+            this.strictMode = strictMode;
+        }
+
+        public boolean isCacheEnabled() {
+            return cacheEnabled;
+        }
+
+        public void setCacheEnabled(boolean cacheEnabled) {
+            this.cacheEnabled = cacheEnabled;
+        }
+
+        public int getCacheTTLSeconds() {
+            return cacheTTLSeconds;
+        }
+
+        public void setCacheTTLSeconds(int cacheTTLSeconds) {
+            this.cacheTTLSeconds = cacheTTLSeconds;
+        }
+    }
+
+    /**
+     * Token validation response DTO
+     */
+    public static class TokenValidationResponse {
+        private boolean valid;
+        private String username;
+        private String role;
+        private String userId;
+        private Long expiresAt;
+
+        public TokenValidationResponse() {}
+
+        public TokenValidationResponse(boolean valid, String username, String role, String userId) {
+            this.valid = valid;
+            this.username = username;
+            this.role = role;
+            this.userId = userId;
+        }
+
+        // Getters and setters
+        public boolean isValid() {
+            return valid;
+        }
+
+        public void setValid(boolean valid) {
+            this.valid = valid;
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public void setUsername(String username) {
+            this.username = username;
+        }
+
+        public String getRole() {
+            return role;
+        }
+
+        public void setRole(String role) {
+            this.role = role;
+        }
+
+        public String getUserId() {
+            return userId;
+        }
+
+        public void setUserId(String userId) {
+            this.userId = userId;
+        }
+
+        public Long getExpiresAt() {
+            return expiresAt;
+        }
+
+        public void setExpiresAt(Long expiresAt) {
+            this.expiresAt = expiresAt;
+        }
+    }
+}
+package com.gateway.config;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Configuration for public endpoints that don't require JWT authentication
+ */
+@Configuration
+@ConfigurationProperties(prefix = "security")
+@Data
+public class PublicEndpointsConfig {
+
+    /**
+     * List of public endpoint patterns (supports Ant path matching)
+     */
+    private List<String> publicEndpoints = new ArrayList<>();
+
+    @PostConstruct
+    public void init() {
+        // Add default public endpoints if none configured
+        if (publicEndpoints.isEmpty()) {
+            publicEndpoints.addAll(getDefaultPublicEndpoints());
+        }
+        
+        // Log configured public endpoints
+        System.out.println("Configured public endpoints:");
+        publicEndpoints.forEach(endpoint -> System.out.println("  - " + endpoint));
+    }
+
+    /**
+     * Get default public endpoints
+     */
+    private List<String> getDefaultPublicEndpoints() {
+        return Arrays.asList(
+            // Authentication endpoints
+            "/api/auth/register",
+            "/api/auth/login",
+            "/api/auth/refresh",
+            "/api/auth/forgot-password",
+            "/api/auth/reset-password",
+            
+            // Health and monitoring
+            "/actuator/**",
+            "/health/**",
+            "/info",
+            
+            // API documentation
+            "/swagger-ui/**",
+            "/swagger-ui.html",
+            "/v3/api-docs/**",
+            "/swagger-resources/**",
+            "/webjars/**",
+            
+            // Static resources
+            "/favicon.ico",
+            "/error"
+        );
+    }
+
+    /**
+     * Check if a path matches any public endpoint pattern
+     */
+    public boolean isPublicEndpoint(String path) {
+        return publicEndpoints.stream()
+            .anyMatch(pattern -> matchesPattern(pattern, path));
+    }
+
+    /**
+     * Simple pattern matching (supports * and **)
+     */
+    private boolean matchesPattern(String pattern, String path) {
+        if (pattern.equals(path)) {
+            return true;
+        }
+        
+        // Convert pattern to regex
+        String regex = pattern
+            .replace(".", "\\.")
+            .replace("*", ".*")
+            .replace("?", ".");
+        
+        return path.matches(regex);
+    }
+
+    /**
+     * Add a public endpoint at runtime
+     */
+    public void addPublicEndpoint(String pattern) {
+        if (!publicEndpoints.contains(pattern)) {
+            publicEndpoints.add(pattern);
+        }
+    }
+
+    /**
+     * Remove a public endpoint at runtime
+     */
+    public void removePublicEndpoint(String pattern) {
+        publicEndpoints.remove(pattern);
+    }
+}

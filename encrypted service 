@@ -1,0 +1,427 @@
+package com.gateway.service;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+import java.util.Base64;
+import java.util.regex.Pattern;
+
+/**
+ * Enhanced AES-GCM Encryption Service with comprehensive error handling
+ * Supports AES/GCM/NoPadding for authenticated encryption
+ */
+@Service
+@Slf4j
+public class EncryptionService {
+
+    @Value("${encryption.secret-key:252A726D4801E120084A503AD5B145EA}")
+    private String secretKey;
+
+    private static final String ALGORITHM = "AES/GCM/NoPadding";
+    private static final String KEY_ALGORITHM = "AES";
+    private static final int GCM_TAG_LENGTH = 128; // 128 bits (16 bytes)
+    private static final int IV_LENGTH = 12; // 96 bits (12 bytes) - recommended for GCM
+    private static final String DELIMITER = ";";
+    
+    // Validation constants
+    private static final int MIN_KEY_LENGTH = 16; // 128 bits
+    private static final int MAX_PLAINTEXT_SIZE = 10 * 1024 * 1024; // 10 MB
+    private static final int MAX_ENCRYPTED_SIZE = 15 * 1024 * 1024; // 15 MB (with overhead)
+    
+    // Regex patterns for validation
+    private static final Pattern BASE64_PATTERN = Pattern.compile(
+        "^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+    );
+    
+    private final SecureRandom secureRandom;
+    
+    public EncryptionService() {
+        this.secureRandom = new SecureRandom();
+    }
+
+    /**
+     * Encrypt plain text using AES-GCM
+     * Format: Base64(IV);Base64(EncryptedData+Tag)
+     * 
+     * @param plainText The text to encrypt
+     * @return Encrypted string in format: IV;EncryptedData
+     * @throws RuntimeException if encryption fails
+     */
+    public String encrypt(String plainText) {
+        // Input validation
+        if (plainText == null) {
+            log.error("Encryption failed: plainText is null");
+            throw new IllegalArgumentException("Plain text cannot be null");
+        }
+        
+        if (plainText.isEmpty()) {
+            log.warn("Encrypting empty string");
+            // Allow empty strings but log warning
+        }
+        
+        if (plainText.length() > MAX_PLAINTEXT_SIZE) {
+            log.error("Plain text size exceeds maximum allowed: {} bytes", plainText.length());
+            throw new IllegalArgumentException(
+                "Plain text size exceeds maximum allowed size of " + (MAX_PLAINTEXT_SIZE / 1024 / 1024) + " MB"
+            );
+        }
+
+        try {
+            // Validate secret key
+            validateSecretKey();
+            
+            // Generate random IV
+            byte[] iv = generateIV();
+            
+            // Initialize cipher
+            Cipher cipher = Cipher.getInstance(ALGORITHM);
+            SecretKeySpec keySpec = new SecretKeySpec(
+                secretKey.getBytes(StandardCharsets.UTF_8), 
+                KEY_ALGORITHM
+            );
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+            
+            cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
+            
+            // Encrypt data
+            byte[] encryptedData = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+            
+            // Encode to Base64
+            String ivEncoded = Base64.getEncoder().encodeToString(iv);
+            String encryptedDataEncoded = Base64.getEncoder().encodeToString(encryptedData);
+            
+            String result = ivEncoded + DELIMITER + encryptedDataEncoded;
+            
+            log.debug("Encryption successful, original size: {} bytes, encrypted size: {} bytes", 
+                plainText.length(), result.length());
+            
+            return result;
+            
+        } catch (IllegalArgumentException e) {
+            log.error("Validation error during encryption: {}", e.getMessage());
+            throw e;
+        } catch (GeneralSecurityException e) {
+            log.error("Encryption failed due to security exception: {}", e.getMessage(), e);
+            throw new RuntimeException("Encryption failed: " + e.getMessage(), e);
+        } catch (Exception e) {
+            log.error("Unexpected error during encryption: {}", e.getMessage(), e);
+            throw new RuntimeException("Encryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Decrypt encrypted text using AES-GCM
+     * Expected format: Base64(IV);Base64(EncryptedData+Tag)
+     * 
+     * @param encryptedText The encrypted text to decrypt
+     * @return Decrypted plain text
+     * @throws RuntimeException if decryption fails
+     */
+    public String decrypt(String encryptedText) {
+        // Input validation
+        if (encryptedText == null) {
+            log.error("Decryption failed: encryptedText is null");
+            throw new IllegalArgumentException("Encrypted text cannot be null");
+        }
+        
+        if (encryptedText.isEmpty()) {
+            log.error("Decryption failed: encryptedText is empty");
+            throw new IllegalArgumentException("Encrypted text cannot be empty");
+        }
+        
+        if (encryptedText.length() > MAX_ENCRYPTED_SIZE) {
+            log.error("Encrypted text size exceeds maximum allowed: {} bytes", encryptedText.length());
+            throw new IllegalArgumentException(
+                "Encrypted text size exceeds maximum allowed size of " + (MAX_ENCRYPTED_SIZE / 1024 / 1024) + " MB"
+            );
+        }
+
+        try {
+            // Validate secret key
+            validateSecretKey();
+            
+            // Parse encrypted text
+            String[] parts = encryptedText.split(DELIMITER, 2);
+            if (parts.length != 2) {
+                log.error("Invalid encrypted text format: missing delimiter or parts. Parts count: {}", parts.length);
+                throw new IllegalArgumentException(
+                    "Invalid encrypted text format. Expected format: Base64(IV);Base64(EncryptedData)"
+                );
+            }
+            
+            String ivEncoded = parts[0];
+            String encryptedDataEncoded = parts[1];
+            
+            // Validate Base64 encoding
+            if (!isValidBase64(ivEncoded)) {
+                log.error("Invalid Base64 encoding for IV");
+                throw new IllegalArgumentException("Invalid Base64 encoding for IV");
+            }
+            
+            if (!isValidBase64(encryptedDataEncoded)) {
+                log.error("Invalid Base64 encoding for encrypted data");
+                throw new IllegalArgumentException("Invalid Base64 encoding for encrypted data");
+            }
+            
+            // Decode Base64
+            byte[] iv;
+            byte[] encryptedData;
+            
+            try {
+                iv = Base64.getDecoder().decode(ivEncoded);
+                encryptedData = Base64.getDecoder().decode(encryptedDataEncoded);
+            } catch (IllegalArgumentException e) {
+                log.error("Base64 decoding failed: {}", e.getMessage());
+                throw new IllegalArgumentException("Failed to decode Base64 data: " + e.getMessage(), e);
+            }
+            
+            // Validate IV length
+            if (iv.length != IV_LENGTH) {
+                log.error("Invalid IV length: {} bytes, expected: {} bytes", iv.length, IV_LENGTH);
+                throw new IllegalArgumentException(
+                    "Invalid IV length: " + iv.length + " bytes, expected: " + IV_LENGTH + " bytes"
+                );
+            }
+            
+            // Validate encrypted data has minimum length (at least GCM tag)
+            if (encryptedData.length < (GCM_TAG_LENGTH / 8)) {
+                log.error("Encrypted data too short: {} bytes", encryptedData.length);
+                throw new IllegalArgumentException("Encrypted data is too short or corrupted");
+            }
+            
+            // Initialize cipher for decryption
+            Cipher cipher = Cipher.getInstance(ALGORITHM);
+            SecretKeySpec keySpec = new SecretKeySpec(
+                secretKey.getBytes(StandardCharsets.UTF_8), 
+                KEY_ALGORITHM
+            );
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+            
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec);
+            
+            // Decrypt data
+            byte[] decryptedData = cipher.doFinal(encryptedData);
+            
+            String result = new String(decryptedData, StandardCharsets.UTF_8);
+            
+            log.debug("Decryption successful, decrypted size: {} bytes", result.length());
+            
+            return result;
+            
+        } catch (IllegalArgumentException e) {
+            log.error("Validation error during decryption: {}", e.getMessage());
+            throw e;
+        } catch (GeneralSecurityException e) {
+            log.error("Decryption failed due to security exception: {}", e.getMessage());
+            
+            // Provide more specific error messages
+            String errorMessage;
+            if (e.getMessage() != null && e.getMessage().contains("Tag mismatch")) {
+                errorMessage = "Decryption failed: Data has been tampered with or wrong key used";
+            } else if (e.getMessage() != null && e.getMessage().contains("Key length")) {
+                errorMessage = "Decryption failed: Invalid key length";
+            } else {
+                errorMessage = "Decryption failed: " + e.getMessage();
+            }
+            
+            throw new RuntimeException(errorMessage, e);
+        } catch (Exception e) {
+            log.error("Unexpected error during decryption: {}", e.getMessage(), e);
+            throw new RuntimeException("Decryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Validate if a string is properly Base64 encoded
+     * 
+     * @param data The string to validate
+     * @return true if valid Base64, false otherwise
+     */
+    public boolean isValidBase64(String data) {
+        if (data == null || data.isEmpty()) {
+            return false;
+        }
+        
+        try {
+            // Remove whitespace
+            String cleaned = data.replaceAll("\\s", "");
+            
+            // Check pattern
+            if (!BASE64_PATTERN.matcher(cleaned).matches()) {
+                return false;
+            }
+            
+            // Try to decode
+            Base64.getDecoder().decode(cleaned);
+            return true;
+            
+        } catch (IllegalArgumentException e) {
+            log.debug("Base64 validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Check if encrypted text format is valid
+     * Format: Base64(IV);Base64(EncryptedData)
+     * 
+     * @param encryptedText The encrypted text to validate
+     * @return true if format is valid, false otherwise
+     */
+    public boolean isValidEncryptedFormat(String encryptedText) {
+        if (encryptedText == null || encryptedText.isEmpty()) {
+            return false;
+        }
+        
+        try {
+            String[] parts = encryptedText.split(DELIMITER, 2);
+            if (parts.length != 2) {
+                return false;
+            }
+            
+            // Validate both parts are Base64
+            return isValidBase64(parts[0]) && isValidBase64(parts[1]);
+            
+        } catch (Exception e) {
+            log.debug("Encrypted format validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Validate secret key
+     */
+    private void validateSecretKey() {
+        if (secretKey == null || secretKey.isEmpty()) {
+            log.error("Secret key is not configured");
+            throw new IllegalStateException("Encryption secret key is not configured");
+        }
+        
+        byte[] keyBytes = secretKey.getBytes(StandardCharsets.UTF_8);
+        if (keyBytes.length < MIN_KEY_LENGTH) {
+            log.error("Secret key is too short: {} bytes, minimum required: {} bytes", 
+                keyBytes.length, MIN_KEY_LENGTH);
+            throw new IllegalStateException(
+                "Secret key is too short. Minimum length: " + MIN_KEY_LENGTH + " bytes (128 bits)"
+            );
+        }
+        
+        // For AES-256, key should be 32 bytes
+        if (keyBytes.length != 16 && keyBytes.length != 24 && keyBytes.length != 32) {
+            log.warn("Secret key length is {} bytes. Recommended: 16 (AES-128), 24 (AES-192), or 32 (AES-256) bytes", 
+                keyBytes.length);
+        }
+    }
+
+    /**
+     * Generate cryptographically secure random IV
+     */
+    private byte[] generateIV() {
+        byte[] iv = new byte[IV_LENGTH];
+        secureRandom.nextBytes(iv);
+        return iv;
+    }
+
+    /**
+     * Encrypt data safely - returns null if encryption fails instead of throwing exception
+     * Useful for non-critical operations
+     * 
+     * @param plainText The text to encrypt
+     * @return Encrypted string or null if encryption fails
+     */
+    public String encryptSafe(String plainText) {
+        try {
+            return encrypt(plainText);
+        } catch (Exception e) {
+            log.error("Safe encryption failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Decrypt data safely - returns null if decryption fails instead of throwing exception
+     * Useful for non-critical operations
+     * 
+     * @param encryptedText The text to decrypt
+     * @return Decrypted string or null if decryption fails
+     */
+    public String decryptSafe(String encryptedText) {
+        try {
+            return decrypt(encryptedText);
+        } catch (Exception e) {
+            log.error("Safe decryption failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Try to decrypt, return original if decryption fails
+     * Useful for backward compatibility
+     * 
+     * @param text The text to decrypt
+     * @return Decrypted text or original if decryption fails
+     */
+    public String decryptOrOriginal(String text) {
+        if (text == null) {
+            return null;
+        }
+        
+        if (!isValidEncryptedFormat(text)) {
+            log.debug("Text is not in encrypted format, returning original");
+            return text;
+        }
+        
+        try {
+            return decrypt(text);
+        } catch (Exception e) {
+            log.warn("Decryption failed, returning original text: {}", e.getMessage());
+            return text;
+        }
+    }
+
+    /**
+     * Get encryption algorithm information
+     */
+    public String getAlgorithmInfo() {
+        return String.format(
+            "Algorithm: %s, Tag Length: %d bits, IV Length: %d bytes, Key Length: %d bytes",
+            ALGORITHM, GCM_TAG_LENGTH, IV_LENGTH, 
+            secretKey != null ? secretKey.getBytes(StandardCharsets.UTF_8).length : 0
+        );
+    }
+
+    /**
+     * Test encryption/decryption with sample data
+     * Useful for health checks
+     * 
+     * @return true if encryption/decryption works correctly
+     */
+    public boolean testEncryption() {
+        try {
+            String testData = "Test encryption data - " + System.currentTimeMillis();
+            String encrypted = encrypt(testData);
+            String decrypted = decrypt(encrypted);
+            
+            boolean success = testData.equals(decrypted);
+            
+            if (success) {
+                log.info("Encryption test passed successfully");
+            } else {
+                log.error("Encryption test failed: decrypted data doesn't match original");
+            }
+            
+            return success;
+            
+        } catch (Exception e) {
+            log.error("Encryption test failed with exception: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+}

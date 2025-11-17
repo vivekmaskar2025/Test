@@ -1,0 +1,636 @@
+package com.auth.service;
+
+import com.auth.dto.AuthResponse;
+import com.auth.dto.LoginRequest;
+import com.auth.dto.RegisterRequest;
+import com.auth.entity.User;
+import com.auth.exception.DuplicateResourceException;
+import com.auth.exception.InvalidCredentialsException;
+import com.auth.exception.ResourceNotFoundException;
+import com.auth.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AuthService {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
+
+    @Value("${jwt.expiration}")
+    private Long jwtExpiration;
+
+    @Transactional
+    public AuthResponse register(RegisterRequest request) {
+        log.info("Registering new user: {}", request.getUsername());
+
+        // Validate unique username
+        if (userRepository.existsByUsername(request.getUsername())) {
+            log.error("Username already exists: {}", request.getUsername());
+            throw new DuplicateResourceException("Username already exists");
+        }
+
+        // Validate unique email
+        if (userRepository.existsByEmail(request.getEmail())) {
+            log.error("Email already exists: {}", request.getEmail());
+            throw new DuplicateResourceException("Email already exists");
+        }
+
+        // Determine role
+        User.Role role;
+        try {
+            role = User.Role.valueOf(request.getRole().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid role provided: {}, defaulting to USER", request.getRole());
+            role = User.Role.USER;
+        }
+
+        // Create user
+        User user = User.builder()
+                .username(request.getUsername())
+                .email(request.getEmail())
+                .password(passwordEncoder.encode(request.getPassword()))
+                .role(role)
+                .active(true)
+                .build();
+
+        user = userRepository.save(user);
+        log.info("User registered successfully: {}", user.getUsername());
+
+        // Generate tokens
+        String accessToken = jwtService.generateToken(user.getUsername(), user.getRole().name());
+        String refreshToken = jwtService.generateRefreshToken(user.getUsername());
+
+        return AuthResponse.builder()
+                .accessToken(accessToken)
+                .refreshToken(refreshToken)
+                .tokenType("Bearer")
+                .expiresIn(jwtExpiration / 1000) // Convert to seconds
+                .username(user.getUsername())
+                .role(user.getRole().name())
+                .build();
+    }
+
+    @Transactional(readOnly = true)
+    public AuthResponse login(LoginRequest request) {
+        log.info("User attempting to login: {}", request.getUsername());
+
+        // Find user by username
+        User user = userRepository.findByUsername(request.getUsername())
+                .orElseThrow(() -> {
+                    log.error("User not found: {}", request.getUsername());
+                    return new InvalidCredentialsException("Invalid username or password");
+                });
+
+        // Check if user is active
+        if (!user.isActive()) {
+            log.error("User account is inactive: {}", request.getUsername());
+            throw new InvalidCredentialsException("User account is inactive");
+        }
+
+        // Verify password
+        if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+            log.error("Invalid password for user: {}", request.getUsername());
+            throw new InvalidCredentialsException("Invalid username or password");
+        }
+
+        log.info("User logged in successfully: {}", user.getUsername());
+
+        // Generate tokens
+        String accessToken = jwtService.generateToken(user.getUsername(), user.getRole().name());
+        String refreshToken = jwtService.generateRefreshToken(user.getUsername());
+
+        return AuthResponse.builder()
+                .accessToken(accessToken)
+                .refreshToken(refreshToken)
+                .tokenType("Bearer")
+                .expiresIn(jwtExpiration / 1000)
+                .username(user.getUsername())
+                .role(user.getRole().name())
+                .build();
+    }
+
+    @Transactional(readOnly = true)
+    public AuthResponse refreshToken(String refreshToken) {
+        log.info("Refreshing token");
+
+        // Validate refresh token
+        if (!jwtService.validateToken(refreshToken)) {
+            log.error("Invalid or expired refresh token");
+            throw new InvalidCredentialsException("Invalid or expired refresh token");
+        }
+
+        // Extract username from refresh token
+        String username = jwtService.extractUsername(refreshToken);
+
+        // Find user
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> {
+                    log.error("User not found: {}", username);
+                    return new ResourceNotFoundException("User not found");
+                });
+
+        // Check if user is active
+        if (!user.isActive()) {
+            log.error("User account is inactive: {}", username);
+            throw new InvalidCredentialsException("User account is inactive");
+        }
+
+        log.info("Token refreshed successfully for user: {}", username);
+
+        // Generate new tokens
+        String newAccessToken = jwtService.generateToken(user.getUsername(), user.getRole().name());
+        String newRefreshToken = jwtService.generateRefreshToken(user.getUsername());
+
+        return AuthResponse.builder()
+                .accessToken(newAccessToken)
+                .refreshToken(newRefreshToken)
+                .tokenType("Bearer")
+                .expiresIn(jwtExpiration / 1000)
+                .username(user.getUsername())
+                .role(user.getRole().name())
+                .build();
+    }
+
+    @Transactional(readOnly = true)
+    public boolean validateToken(String token) {
+        try {
+            if (!jwtService.validateToken(token)) {
+                return false;
+            }
+
+            String username = jwtService.extractUsername(token);
+            User user = userRepository.findByUsername(username)
+                    .orElse(null);
+
+            return user != null && user.isActive();
+        } catch (Exception e) {
+            log.error("Token validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public User getUserFromToken(String token) {
+        String username = jwtService.extractUsername(token);
+        return userRepository.findByUsername(username)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found"));
+    }
+}
+package com.auth.service;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Function;
+
+@Service
+@Slf4j
+public class JwtService {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.expiration}")
+    private Long expiration;
+
+    @Value("${jwt.refresh-expiration}")
+    private Long refreshExpiration;
+
+    private SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public String generateToken(String username, String role) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("role", role);
+        return createToken(claims, username, expiration);
+    }
+
+    public String generateRefreshToken(String username) {
+        Map<String, Object> claims = new HashMap<>();
+        return createToken(claims, username, refreshExpiration);
+    }
+
+    private String createToken(Map<String, Object> claims, String subject, Long expirationTime) {
+        Date now = new Date();
+        Date expiryDate = new Date(now.getTime() + expirationTime);
+
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(subject)
+                .setIssuedAt(now)
+                .setExpiration(expiryDate)
+                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    public String extractUsername(String token) {
+        return extractClaim(token, Claims::getSubject);
+    }
+
+    public String extractRole(String token) {
+        return extractClaim(token, claims -> claims.get("role", String.class));
+    }
+
+    public Date extractExpiration(String token) {
+        return extractClaim(token, Claims::getExpiration);
+    }
+
+    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
+
+    private Claims extractAllClaims(String token) {
+        try {
+            return Jwts.parserBuilder()
+                    .setSigningKey(getSigningKey())
+                    .build()
+                    .parseClaimsJws(token)
+                    .getBody();
+        } catch (Exception e) {
+            log.error("Error extracting claims from token: {}", e.getMessage());
+            throw new RuntimeException("Invalid token");
+        }
+    }
+
+    public Boolean validateToken(String token, String username) {
+        try {
+            final String extractedUsername = extractUsername(token);
+            return (extractedUsername.equals(username) && !isTokenExpired(token));
+        } catch (Exception e) {
+            log.error("Token validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    public Boolean validateToken(String token) {
+        try {
+            extractAllClaims(token);
+            return !isTokenExpired(token);
+        } catch (Exception e) {
+            log.error("Token validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private Boolean isTokenExpired(String token) {
+        try {
+            return extractExpiration(token).before(new Date());
+        } catch (Exception e) {
+            return true;
+        }
+    }
+}
+package com.auth.controller;
+
+import com.auth.dto.*;
+import com.auth.entity.User;
+import com.auth.service.AuthService;
+import com.auth.service.JwtService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping
+@RequiredArgsConstructor
+@Slf4j
+public class AuthController {
+
+    private final AuthService authService;
+    private final JwtService jwtService;
+
+    @PostMapping("/register")
+    public ResponseEntity<AuthResponse> register(@Valid @RequestBody RegisterRequest request) {
+        log.info("Register request received for username: {}", request.getUsername());
+        AuthResponse response = authService.register(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<AuthResponse> login(@Valid @RequestBody LoginRequest request) {
+        log.info("Login request received for username: {}", request.getUsername());
+        AuthResponse response = authService.login(request);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/refresh")
+    public ResponseEntity<AuthResponse> refreshToken(@Valid @RequestBody RefreshTokenRequest request) {
+        log.info("Token refresh request received");
+        AuthResponse response = authService.refreshToken(request.getRefreshToken());
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/validate")
+    public ResponseEntity<TokenValidationResponse> validateToken(
+            @RequestHeader("Authorization") String authHeader) {
+        log.info("Token validation request received");
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            log.error("Invalid authorization header");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(new TokenValidationResponse(false, null, null));
+        }
+
+        String token = authHeader.substring(7);
+        boolean isValid = authService.validateToken(token);
+
+        if (isValid) {
+            try {
+                String username = jwtService.extractUsername(token);
+                String role = jwtService.extractRole(token);
+                log.info("Token validated successfully for user: {}", username);
+                return ResponseEntity.ok(new TokenValidationResponse(true, username, role));
+            } catch (Exception e) {
+                log.error("Error extracting token details: {}", e.getMessage());
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(new TokenValidationResponse(false, null, null));
+            }
+        } else {
+            log.error("Token validation failed");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(new TokenValidationResponse(false, null, null));
+        }
+    }
+
+    @PostMapping("/logout")
+    public ResponseEntity<ApiResponse> logout(@RequestHeader("Authorization") String authHeader) {
+        log.info("Logout request received");
+        // In a production system, you might want to blacklist the token
+        // For now, we'll just return success as JWT is stateless
+        return ResponseEntity.ok(new ApiResponse(true, "Logged out successfully"));
+    }
+
+    // Response wrapper
+    public static class ApiResponse {
+        private boolean success;
+        private String message;
+
+        public ApiResponse() {}
+
+        public ApiResponse(boolean success, String message) {
+            this.success = success;
+            this.message = message;
+        }
+
+        public boolean isSuccess() {
+            return success;
+        }
+
+        public void setSuccess(boolean success) {
+            this.success = success;
+        }
+
+        public String getMessage() {
+            return message;
+        }
+
+        public void setMessage(String message) {
+            this.message = message;
+        }
+    }
+}
+package com.auth.exception;
+
+public class DuplicateResourceException extends RuntimeException {
+    public DuplicateResourceException(String message) {
+        super(message);
+    }
+}
+
+// ---
+
+package com.auth.exception;
+
+public class InvalidCredentialsException extends RuntimeException {
+    public InvalidCredentialsException(String message) {
+        super(message);
+    }
+}
+
+// ---
+
+package com.auth.exception;
+
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+package com.auth.exception;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.WebRequest;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.Map;
+
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(DuplicateResourceException.class)
+    public ResponseEntity<ErrorResponse> handleDuplicateResourceException(
+            DuplicateResourceException ex, WebRequest request) {
+        log.error("Duplicate resource error: {}", ex.getMessage());
+        
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.CONFLICT.value(),
+                "Conflict",
+                ex.getMessage(),
+                request.getDescription(false).replace("uri=", ""),
+                getCurrentTimestamp()
+        );
+        
+        return new ResponseEntity<>(error, HttpStatus.CONFLICT);
+    }
+
+    @ExceptionHandler(InvalidCredentialsException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidCredentialsException(
+            InvalidCredentialsException ex, WebRequest request) {
+        log.error("Invalid credentials error: {}", ex.getMessage());
+        
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.UNAUTHORIZED.value(),
+                "Unauthorized",
+                ex.getMessage(),
+                request.getDescription(false).replace("uri=", ""),
+                getCurrentTimestamp()
+        );
+        
+        return new ResponseEntity<>(error, HttpStatus.UNAUTHORIZED);
+    }
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleResourceNotFoundException(
+            ResourceNotFoundException ex, WebRequest request) {
+        log.error("Resource not found error: {}", ex.getMessage());
+        
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.NOT_FOUND.value(),
+                "Not Found",
+                ex.getMessage(),
+                request.getDescription(false).replace("uri=", ""),
+                getCurrentTimestamp()
+        );
+        
+        return new ResponseEntity<>(error, HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ValidationErrorResponse> handleValidationExceptions(
+            MethodArgumentNotValidException ex, WebRequest request) {
+        log.error("Validation error occurred");
+        
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getAllErrors().forEach((error) -> {
+            String fieldName = ((FieldError) error).getField();
+            String errorMessage = error.getDefaultMessage();
+            errors.put(fieldName, errorMessage);
+        });
+        
+        ValidationErrorResponse error = new ValidationErrorResponse(
+                HttpStatus.BAD_REQUEST.value(),
+                "Validation Failed",
+                "Invalid input parameters",
+                request.getDescription(false).replace("uri=", ""),
+                getCurrentTimestamp(),
+                errors
+        );
+        
+        return new ResponseEntity<>(error, HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ErrorResponse> handleIllegalArgumentException(
+            IllegalArgumentException ex, WebRequest request) {
+        log.error("Illegal argument error: {}", ex.getMessage());
+        
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.BAD_REQUEST.value(),
+                "Bad Request",
+                ex.getMessage(),
+                request.getDescription(false).replace("uri=", ""),
+                getCurrentTimestamp()
+        );
+        
+        return new ResponseEntity<>(error, HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGlobalException(
+            Exception ex, WebRequest request) {
+        log.error("Unexpected error occurred: {}", ex.getMessage(), ex);
+        
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                "Internal Server Error",
+                "An unexpected error occurred",
+                request.getDescription(false).replace("uri=", ""),
+                getCurrentTimestamp()
+        );
+        
+        return new ResponseEntity<>(error, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    private String getCurrentTimestamp() {
+        return LocalDateTime.now().format(DateTimeFormatter.ISO_DATE_TIME);
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ErrorResponse {
+        private int status;
+        private String error;
+        private String message;
+        private String path;
+        private String timestamp;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ValidationErrorResponse {
+        private int status;
+        private String error;
+        private String message;
+        private String path;
+        private String timestamp;
+        private Map<String, String> validationErrors;
+    }
+}
+package com.auth.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(
+                    "/register",
+                    "/login",
+                    "/refresh",
+                    "/validate"
+                ).permitAll()
+                .anyRequest().authenticated()
+            )
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+
+        return http.build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}

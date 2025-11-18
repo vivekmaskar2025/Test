@@ -1,0 +1,766 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>gateway</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <java.version>17</java.version>
+        <spring.boot.version>3.2.8</spring.boot.version>
+        <!-- pick an appropriate Spring Cloud BOM version for 2025; adjust if needed -->
+        <spring.cloud.version>2025.0.0</spring.cloud.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring.boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring.cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-gateway</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.projectreactor.netty</groupId>
+            <artifactId>reactor-netty-http</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-codec</groupId>
+            <artifactId>commons-codec</artifactId>
+        </dependency>
+
+        <!-- resilience4j circuit breaker (optional but recommended) -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-reactor</artifactId>
+        </dependency>
+
+        <!-- testing -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: gateway
+  main:
+    allow-bean-definition-overriding: true
+
+gateway:
+  auth:
+    url: http://localhost:8085/auth/validateToken
+    timeout-ms: 3500
+    max-body-bytes: 1MB # for request body max size
+
+logging:
+  level:
+    root: INFO
+    com.example.gateway: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+
+package com.example.gateway.config;
+
+import org.springframework.cloud.gateway.route.RouteLocator;
+import org.springframework.cloud.gateway.route.builder.RouteLocatorBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class GatewayRoutesConfig {
+
+    @Bean
+    public RouteLocator routeLocator(RouteLocatorBuilder builder) {
+        return builder.routes()
+                .route("admin_route", r -> r
+                        .path("/gateway/adminServ/**")
+                        .filters(f -> f.stripPrefix(1))
+                        .uri("http://localhost:8081")
+                )
+                .route("client_route", r -> r
+                        .path("/gateway/clientServ/**")
+                        .filters(f -> f.stripPrefix(1))
+                        .uri("http://localhost:8082")
+                )
+                .build();
+    }
+}
+
+package com.example.gateway.util;
+
+import org.apache.commons.codec.binary.Base64;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+
+public final class CryptoUtils {
+    private static final Logger log = LoggerFactory.getLogger(CryptoUtils.class);
+    private static final String TRANSFORMATION = "AES/CBC/PKCS5Padding";
+    private static final String ALGO = "AES";
+
+    private CryptoUtils() {}
+
+    private static SecretKeySpec getKey() {
+        String keyB64 = System.getenv("GATEWAY_AES_KEY_B64");
+        if (keyB64 == null) throw new IllegalStateException("GATEWAY_AES_KEY_B64 env var not set");
+        byte[] key = Base64.decodeBase64(keyB64);
+        return new SecretKeySpec(key, ALGO);
+    }
+
+    private static IvParameterSpec getIv() {
+        String ivB64 = System.getenv("GATEWAY_AES_IV_B64");
+        if (ivB64 == null) throw new IllegalStateException("GATEWAY_AES_IV_B64 env var not set");
+        byte[] iv = Base64.decodeBase64(ivB64);
+        return new IvParameterSpec(iv);
+    }
+
+    public static byte[] decrypt(byte[] cipherTextBase64) throws Exception {
+        if (cipherTextBase64 == null || cipherTextBase64.length == 0) return cipherTextBase64;
+        try {
+            byte[] cipherBytes = Base64.decodeBase64(cipherTextBase64);
+            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+            cipher.init(Cipher.DECRYPT_MODE, getKey(), getIv());
+            return cipher.doFinal(cipherBytes);
+        } catch (Exception e) {
+            log.debug("Decrypt failed", e);
+            throw e;
+        }
+    }
+
+    public static byte[] encrypt(byte[] plain) throws Exception {
+        if (plain == null || plain.length == 0) return plain;
+        try {
+            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+            cipher.init(Cipher.ENCRYPT_MODE, getKey(), getIv());
+            byte[] enc = cipher.doFinal(plain);
+            return Base64.encodeBase64(enc);
+        } catch (Exception e) {
+            log.debug("Encrypt failed", e);
+            throw e;
+        }
+    }
+}
+
+
+package com.example.gateway.service;
+
+import com.example.gateway.exception.AuthServiceUnavailableException;
+import com.example.gateway.exception.UnauthorizedException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+
+@Component
+public class AuthServiceClient {
+    private static final Logger log = LoggerFactory.getLogger(AuthServiceClient.class);
+
+    private final WebClient webClient;
+    private final Duration timeout;
+
+    public AuthServiceClient(@Value("${gateway.auth.url}") String authUrl,
+                             @Value("${gateway.auth.timeout-ms:3500}") long timeoutMs) {
+        this.webClient = WebClient.builder()
+                .baseUrl(authUrl)
+                .build();
+        this.timeout = Duration.ofMillis(timeoutMs);
+    }
+
+    public Mono<Void> validateToken(String jwt, String correlationId) {
+        if (jwt == null || jwt.isBlank()) return Mono.error(new UnauthorizedException("Missing Authorization token"));
+
+        return webClient.post()
+                .contentType(MediaType.APPLICATION_JSON)
+                .header(HttpHeaders.AUTHORIZATION, jwt)
+                .header("X-Correlation-Id", correlationId)
+                .retrieve()
+                .toBodilessEntity()
+                .timeout(timeout)
+                .onErrorMap(throwable -> {
+                    if (throwable instanceof WebClientResponseException) {
+                        WebClientResponseException w = (WebClientResponseException) throwable;
+                        if (w.getStatusCode().value() == 401) return new UnauthorizedException("Invalid token");
+                        return new AuthServiceUnavailableException("Auth service error: " + w.getStatusCode());
+                    }
+                    return new AuthServiceUnavailableException("Auth service unreachable");
+                })
+                .then();
+    }
+}
+
+package com.example.gateway.filter;
+
+import com.example.gateway.exception.*;
+import com.example.gateway.service.AuthServiceClient;
+import com.example.gateway.util.CryptoUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
+import org.springframework.stereotype.Component;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+@Slf4j
+@Component
+public class DecryptAuthRouteEncryptFilter implements GlobalFilter, Ordered {
+
+    private final AuthServiceClient authClient;
+    private final long maxBodyBytes;
+
+    public DecryptAuthRouteEncryptFilter(AuthServiceClient authClient,
+                                         @Value("${gateway.auth.max-body-bytes:1048576}") String maxBody) {
+        this.authClient = authClient;
+        // parse sizes like 1MB or bytes
+        this.maxBodyBytes = parseSize(maxBody);
+    }
+
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE + 10;
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, org.springframework.cloud.gateway.filter.GatewayFilterChain chain) {
+        String correlationId = exchange.getRequest().getId();
+        exchange.getResponse().getHeaders().add("X-Correlation-Id", correlationId);
+
+        ServerHttpRequest request = exchange.getRequest();
+        HttpHeaders originalHeaders = new HttpHeaders();
+        originalHeaders.putAll(request.getHeaders());
+
+        // 1. Join request body (bounded)
+        return DataBufferUtils.join(request.getBody())
+                .map(dataBuffer -> {
+                    int len = dataBuffer.readableByteCount();
+                    if (len > maxBodyBytes) {
+                        DataBufferUtils.release(dataBuffer);
+                        throw new PayloadTooLargeException("Request body too large: " + len);
+                    }
+                    byte[] bytes = new byte[len];
+                    dataBuffer.read(bytes);
+                    DataBufferUtils.release(dataBuffer);
+                    return bytes;
+                })
+                .defaultIfEmpty(new byte[0])
+                .flatMap(bodyBytes -> {
+                    // 2. Attempt to decrypt body (if present)
+                    byte[] decryptedBody;
+                    try {
+                        if (bodyBytes.length == 0) {
+                            decryptedBody = bodyBytes;
+                        } else {
+                            // assume base64 encoded ciphertext in body
+                            decryptedBody = CryptoUtils.decrypt(bodyBytes);
+                        }
+                    } catch (Exception e) {
+                        log.warn("Body decryption failed", e);
+                        // depending on policy, reject or continue with original; we reject here
+                        throw new DecryptionException("Failed to decrypt request body", e);
+                    }
+
+                    // 3. Decrypt headers if needed (example header X-Enc-Header)
+                    HttpHeaders mutatedHeaders = new HttpHeaders();
+                    mutatedHeaders.putAll(originalHeaders);
+
+                    List<String> encHeader = mutatedHeaders.getOrDefault("X-Enc-Header", List.of());
+                    if (!encHeader.isEmpty()) {
+                        try {
+                            String dec = new String(CryptoUtils.decrypt(encHeader.get(0).getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8);
+                            mutatedHeaders.set("X-Enc-Header", dec);
+                        } catch (Exception e) {
+                            log.warn("Header decryption failed", e);
+                            // continue with original header
+                        }
+                    }
+
+                    // 4. Decrypt query param 'enc' if present
+                    ServerHttpRequest mutatedRequestBase = request.mutate().headers(h -> h.clear()).build();
+
+                    ServerHttpRequestDecorator requestDecorator = new ServerHttpRequestDecorator(mutatedRequestBase) {
+                        @Override
+                        public HttpHeaders getHeaders() {
+                            return mutatedHeaders;
+                        }
+
+                        @Override
+                        public Flux<DataBuffer> getBody() {
+                            return Flux.just(exchange.getResponse().bufferFactory().wrap(decryptedBody));
+                        }
+                    };
+
+                    ServerWebExchange mutatedExchange = exchange.mutate().request(requestDecorator).build();
+
+                    // 5. Extract JWT and call auth service
+                    String jwt = mutatedHeaders.getFirst(HttpHeaders.AUTHORIZATION);
+                    if (jwt == null || jwt.isBlank()) {
+                        return Mono.error(new UnauthorizedException("Missing Authorization header"));
+                    }
+
+                    return authClient.validateToken(jwt, correlationId)
+                            .then(Mono.defer(() -> {
+                                // 6. Decorate response to encrypt 2xx
+                                ServerHttpResponse originalResponse = mutatedExchange.getResponse();
+                                ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+                                    AtomicBoolean written = new AtomicBoolean(false);
+
+                                    @Override
+                                    public Mono<Void> writeWith(org.reactivestreams.Publisher<? extends DataBuffer> body) {
+                                        // only process once
+                                        if (written.getAndSet(true)) {
+                                            return super.writeWith(body);
+                                        }
+
+                                        HttpStatus status = getStatusCode();
+                                        if (status != null && status.is2xxSuccessful()) {
+                                            Flux<? extends DataBuffer> flux = (body instanceof Flux) ? (Flux<? extends DataBuffer>) body : Flux.from(body);
+                                            return super.writeWith(
+                                                    flux.collectList().flatMapMany(list -> {
+                                                        int total = list.stream().mapToInt(DataBuffer::readableByteCount).sum();
+                                                        byte[] combined = new byte[total];
+                                                        int pos = 0;
+                                                        for (DataBuffer db : list) {
+                                                            int r = db.readableByteCount();
+                                                            db.read(combined, pos, r);
+                                                            pos += r;
+                                                            DataBufferUtils.release(db);
+                                                        }
+                                                        try {
+                                                            byte[] enc = CryptoUtils.encrypt(combined);
+                                                            return Flux.just(getDelegate().bufferFactory().wrap(enc));
+                                                        } catch (Exception e) {
+                                                            log.error("Response encryption failed; sending original body", e);
+                                                            return Flux.just(getDelegate().bufferFactory().wrap(combined));
+                                                        }
+                                                    })
+                                            );
+                                        } else {
+                                            return super.writeWith(body);
+                                        }
+                                    }
+
+                                    @Override
+                                    public Mono<Void> writeAndFlushWith(org.reactivestreams.Publisher<? extends org.reactivestreams.Publisher<? extends DataBuffer>> body) {
+                                        return writeWith(Flux.from(body).flatMapSequential(p -> p));
+                                    }
+                                };
+
+                                ServerWebExchange exchangeWithDecoratedResponse = mutatedExchange.mutate().response(decoratedResponse).build();
+                                // 7. Forward to downstream
+                                return chain.filter(exchangeWithDecoratedResponse);
+                            }));
+                })
+                .onErrorResume(throwable -> {
+                    // map known exceptions to appropriate HTTP status & JSON body
+                    log.error("Filter error: {}", throwable.getMessage());
+                    if (throwable instanceof UnauthorizedException) {
+                        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                        byte[] bytes = ("{\"error\":\"Unauthorized\",\"message\":\"" + throwable.getMessage() + "\"}").getBytes();
+                        return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+                    }
+                    if (throwable instanceof PayloadTooLargeException) {
+                        exchange.getResponse().setStatusCode(HttpStatus.PAYLOAD_TOO_LARGE);
+                        byte[] bytes = ("{\"error\":\"PayloadTooLarge\",\"message\":\"" + throwable.getMessage() + "\"}").getBytes();
+                        return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+                    }
+                    if (throwable instanceof AuthServiceUnavailableException) {
+                        exchange.getResponse().setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
+                        byte[] bytes = ("{\"error\":\"AuthServiceUnavailable\",\"message\":\"" + throwable.getMessage() + "\"}").getBytes();
+                        return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+                    }
+
+                    exchange.getResponse().setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR);
+                    byte[] bytes = ("{\"error\":\"InternalServerError\",\"message\":\"" + throwable.getMessage() + "\"}").getBytes();
+                    return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+                });
+    }
+
+    private static long parseSize(String s) {
+        if (s == null) return 1048576L;
+        s = s.trim().toUpperCase();
+        try {
+            if (s.endsWith("MB")) return Long.parseLong(s.replace("MB", "")) * 1024 * 1024;
+            if (s.endsWith("KB")) return Long.parseLong(s.replace("KB", "")) * 1024;
+            if (s.endsWith("B")) return Long.parseLong(s.replace("B", ""));
+            return Long.parseLong(s);
+        } catch (NumberFormatException e) {
+            return 1048576L;
+        }
+    }
+}
+
+package com.example.gateway.exception;
+
+public class UnauthorizedException extends RuntimeException {
+    public UnauthorizedException(String msg) { super(msg); }
+}
+
+package com.example.gateway.exception;
+
+import java.time.Instant;
+import java.util.Map;
+
+public class ApiError {
+    private Instant timestamp = Instant.now();
+    private int status;
+    private String error;
+    private String message;
+    private String traceId;
+    private Map<String, Object> details;
+
+    public ApiError(int status, String error, String message, String traceId, Map<String, Object> details) {
+        this.status = status;
+        this.error = error;
+        this.message = message;
+        this.traceId = traceId;
+        this.details = details;
+    }
+
+    public Instant getTimestamp() { return timestamp; }
+    public int getStatus() { return status; }
+    public String getError() { return error; }
+    public String getMessage() { return message; }
+    public String getTraceId() { return traceId; }
+    public Map<String, Object> getDetails() { return details; }
+}
+
+
+package com.example.gateway.exception;
+
+import org.springframework.boot.web.error.ErrorAttributeOptions;
+import org.springframework.boot.web.reactive.error.DefaultErrorAttributes;
+import org.springframework.web.server.ServerWebExchange;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class CustomErrorAttributes extends DefaultErrorAttributes {
+
+    @Override
+    public Map<String, Object> getErrorAttributes(ServerWebExchange exchange,
+                                                  ErrorAttributeOptions options) {
+        Throwable error = getError(exchange);
+
+        int status = exchange.getResponse().getStatusCode() != null
+                ? exchange.getResponse().getStatusCode().value()
+                : 500;
+
+        ApiError apiError = new ApiError(
+                status,
+                error.getClass().getSimpleName(),
+                error.getMessage(),
+                exchange.getRequest().getHeaders().getFirst("X-Correlation-Id"),
+                Map.of(
+                        "path", exchange.getRequest().getPath().toString(),
+                        "method", exchange.getRequest().getMethod().name()
+                )
+        );
+
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("timestamp", apiError.getTimestamp());
+        map.put("status", apiError.getStatus());
+        map.put("error", apiError.getError());
+        map.put("message", apiError.getMessage());
+        map.put("traceId", apiError.getTraceId());
+        map.put("details", apiError.getDetails());
+        return map;
+    }
+}
+
+package com.example.gateway.exception;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.web.ResourceProperties;
+import org.springframework.boot.web.reactive.error.ErrorWebExceptionHandler;
+import org.springframework.core.annotation.Order;
+import org.springframework.core.io.buffer.DataBufferFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.server.ServerResponse;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+@Slf4j
+@Component
+@Order(-2)  // must be < -1 so it overrides default Gateway error handler
+public class GlobalExceptionHandler implements ErrorWebExceptionHandler {
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Override
+    public Mono<Void> handle(ServerWebExchange exchange, Throwable ex) {
+        log.error("Global Exception Handler caught: {}", ex.getMessage(), ex);
+
+        HttpStatus status = HttpStatus.INTERNAL_SERVER_ERROR;
+
+        if (ex instanceof IllegalArgumentException) status = HttpStatus.BAD_REQUEST;
+        if (ex instanceof SecurityException)       status = HttpStatus.UNAUTHORIZED;
+        if (ex instanceof RuntimeException &&
+            ex.getMessage() != null &&
+            ex.getMessage().contains("Route") ) status = HttpStatus.SERVICE_UNAVAILABLE;
+
+        exchange.getResponse().setStatusCode(status);
+        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+
+        String correlationId = exchange.getRequest().getHeaders().getFirst("X-Correlation-Id");
+
+        ApiError apiError = new ApiError(
+                status.value(),
+                ex.getClass().getSimpleName(),
+                ex.getMessage(),
+                correlationId,
+                Map.of("path", exchange.getRequest().getPath().value())
+        );
+
+        byte[] bytes;
+        try {
+            bytes = mapper.writeValueAsBytes(apiError);
+        } catch (Exception e) {
+            bytes = "{\"error\":\"SerializationFailure\"}".getBytes();
+        }
+
+        DataBufferFactory bufferFactory = exchange.getResponse().bufferFactory();
+        return exchange.getResponse()
+                .writeWith(Mono.just(bufferFactory.wrap(bytes)));
+    }
+}
+
+
+package com.example.gateway.exception;
+
+public class DecryptionException extends RuntimeException {
+    public DecryptionException(String msg, Throwable cause) {
+        super(msg, cause);
+    }
+}
+
+package com.example.gateway.exception;
+
+public class EncryptionException extends RuntimeException {
+    public EncryptionException(String msg, Throwable cause) {
+        super(msg, cause);
+    }
+}
+
+package com.example.gateway.exception;
+
+public class RoutingFailureException extends RuntimeException {
+    public RoutingFailureException(String msg) {
+        super(msg);
+    }
+}
+
+package com.example.gateway.filter;
+
+import com.example.gateway.exception.DecryptionException;
+import com.example.gateway.exception.EncryptionException;
+import com.example.gateway.exception.RoutingFailureException;
+import com.example.gateway.util.CryptoUtils;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.*;
+import org.springframework.stereotype.Component;
+import org.springframework.util.MultiValueMap;
+import org.springframework.util.StringUtils;
+import org.springframework.web.server.ServerWebExchange;
+
+import reactor.core.publisher.*;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+
+@Slf4j
+@Component
+public class DecryptEncryptGlobalFilter implements GlobalFilter, Ordered {
+
+    private static final String JWT_HEADER = "Authorization";
+
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE + 5;
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+
+        String correlationId = exchange.getRequest().getId();
+        exchange.getResponse().getHeaders().add("X-Correlation-Id", correlationId);
+
+        // Force a trace header for logging
+        exchange.getRequest().mutate().header("X-Correlation-Id", correlationId);
+
+        ServerHttpRequest request = exchange.getRequest();
+
+        return DataBufferUtils.join(request.getBody())
+                .defaultIfEmpty(exchange.getResponse().bufferFactory().wrap(new byte[0]))
+                .flatMap(buffer -> processRequest(exchange, buffer, chain))
+                .onErrorResume(ex -> {
+                    log.error("Filter-Level Exception: {}", ex.getMessage(), ex);
+                    exchange.getResponse().setStatusCode(HttpStatus.BAD_REQUEST);
+                    throw new DecryptionException("Request processing failed", ex);
+                });
+    }
+
+    private Mono<Void> processRequest(ServerWebExchange exchange,
+                                      DataBuffer originalBody,
+                                      GatewayFilterChain chain) {
+
+        byte[] bodyBytes = new byte[originalBody.readableByteCount()];
+        originalBody.read(bodyBytes);
+        DataBufferUtils.release(originalBody);
+
+        byte[] decryptedBytes = null;
+
+        if (bodyBytes.length > 0) {
+            try {
+                decryptedBytes = CryptoUtils.decrypt(bodyBytes);
+            } catch (Exception e) {
+                throw new DecryptionException("Invalid encrypted body data", e);
+            }
+        } else {
+            decryptedBytes = new byte[0];
+        }
+
+        byte[] finalBody = decryptedBytes;
+
+        Flux<DataBuffer> bodyFlux = Flux.just(exchange.getResponse().bufferFactory().wrap(finalBody));
+
+        ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+                .header("X-Body-Decrypted", "true")
+                .build();
+
+        ServerWebExchange mutatedExchange = exchange.mutate()
+                .request(mutatedRequest)
+                .build();
+
+        return chain.filter(mutatedExchange.mutate().request(mutatedRequest).build())
+                .then(Mono.defer(() -> encryptResponse(mutatedExchange)));
+    }
+
+
+    /** Encrypt 2xx responses */
+    private Mono<Void> encryptResponse(ServerWebExchange exchange) {
+
+        ServerHttpResponse response = exchange.getResponse();
+
+        if (!response.getStatusCode().is2xxSuccessful()) {
+            return Mono.empty();   // forward as-is
+        }
+
+        return response.writeWith(
+                response.getBody()
+                        .collectList()
+                        .flatMap(buffers -> {
+                            try {
+                                int total = buffers.stream().mapToInt(DataBuffer::readableByteCount).sum();
+                                byte[] original = new byte[total];
+                                int pos = 0;
+
+                                for (DataBuffer db : buffers) {
+                                    int r = db.readableByteCount();
+                                    db.read(original, pos, r);
+                                    pos += r;
+                                    DataBufferUtils.release(db);
+                                }
+
+                                byte[] encrypted = CryptoUtils.encrypt(original);
+
+                                DataBuffer wrap = response.bufferFactory().wrap(encrypted);
+                                return Mono.just(wrap);
+
+                            } catch (Exception e) {
+                                throw new EncryptionException("Failed to encrypt response", e);
+                            }
+                        })
+        );
+    }
+}
+
+

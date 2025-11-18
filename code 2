@@ -1,0 +1,53 @@
+package com.example.gateway.util;
+
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.util.Base64;
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+public final class CryptoUtils {
+    // Demo constants — replace with secure retrieval!
+    private static final String AES_KEY_BASE64 = "bXktc2VjcmV0LWtleS0xMjM0NTY3ODkwMTIzNA=="; // 32-bytes key (base64) example
+    private static final String AES_IV_BASE64  = "bXktLWl2LTEyMzQ1Njc4OTA="; // 16-bytes iv (base64) example
+
+    private static final String TRANSFORMATION = "AES/CBC/PKCS5Padding";
+    private static final String ALGORITHM = "AES";
+
+    private CryptoUtils() {}
+
+    private static SecretKeySpec getKeySpec() {
+        byte[] key = Base64.getDecoder().decode(AES_KEY_BASE64);
+        return new SecretKeySpec(key, ALGORITHM);
+    }
+
+    private static IvParameterSpec getIvSpec() {
+        byte[] iv = Base64.getDecoder().decode(AES_IV_BASE64);
+        return new IvParameterSpec(iv);
+    }
+
+    public static byte[] decrypt(byte[] encryptedBytes) throws GeneralSecurityException {
+        if (encryptedBytes == null || encryptedBytes.length == 0) return encryptedBytes;
+        Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+        cipher.init(Cipher.DECRYPT_MODE, getKeySpec(), getIvSpec());
+        return cipher.doFinal(Base64.getDecoder().decode(encryptedBytes));
+    }
+
+    public static byte[] encrypt(byte[] plainBytes) throws GeneralSecurityException {
+        if (plainBytes == null || plainBytes.length == 0) return plainBytes;
+        Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+        cipher.init(Cipher.ENCRYPT_MODE, getKeySpec(), getIvSpec());
+        byte[] encrypted = cipher.doFinal(plainBytes);
+        return Base64.getEncoder().encode(encrypted);
+    }
+
+    // Helpers for strings
+    public static String decryptToString(byte[] encryptedBytes) throws GeneralSecurityException {
+        return new String(decrypt(encryptedBytes), StandardCharsets.UTF_8);
+    }
+
+    public static byte[] encryptFromString(String plain) throws GeneralSecurityException {
+        return encrypt(plain.getBytes(StandardCharsets.UTF_8));
+    }
+}

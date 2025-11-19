@@ -1,0 +1,503 @@
+package com.indusind.trade.api.gateway.filters;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+
+import org.reactivestreams.Publisher;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.cloud.gateway.support.ServerWebExchangeUtils;
+import org.springframework.core.Ordered;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ReactiveHttpOutputMessage;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
+import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.server.PayloadTooLargeException;
+import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.util.UriComponentsBuilder;
+
+import com.indusind.trade.api.gateway.exception.DecryptionException;
+import com.indusind.trade.api.gateway.exception.ServiceUnavailableException;
+import com.indusind.trade.api.gateway.exception.UnauthorizedException;
+import com.indusind.trade.api.gateway.service.AuthServiceClient;
+import com.indusind.trade.api.gateway.utils.AESCryptoUtils;
+
+import io.netty.handler.timeout.TimeoutException;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Slf4j
+@Component
+public class RequestDecResponseEncFilter implements GlobalFilter, Ordered {
+
+    private final AuthServiceClient authClient;
+    private final long maxBodyBytes;
+
+    // comma-separated ant patterns, e.g. /public/**,/health,/login
+    private final List<String> publicEndpointPatterns;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    // multipart fields that are expected encrypted (names). Can also be configured.
+    private final List<String> encryptedMultipartFieldNames;
+
+    public RequestDecResponseEncFilter(
+            AuthServiceClient authClient,
+            @Value("${gateway.req.max.body.bytes:1MB}") String maxBody,
+            @Value("${gateway.public.endpoints:}") String publicEndpointsCsv,
+            @Value("${gateway.multipart.encrypted.field.names:payload,enc}") String multipartFieldNamesCsv) {
+        this.authClient = authClient;
+        this.maxBodyBytes = parseSize(maxBody);
+        this.publicEndpointPatterns = parseCsv(publicEndpointsCsv);
+        this.encryptedMultipartFieldNames = parseCsv(multipartFieldNamesCsv).stream()
+                .map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList());
+    }
+
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE + 10;
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String correlationId = Optional.ofNullable(exchange.getRequest().getId()).orElse(UUID.randomUUID().toString());
+        exchange.getResponse().getHeaders().add("X-Correlation-Id", correlationId);
+
+        ServerHttpRequest request = exchange.getRequest();
+        HttpHeaders originalHeaders = new HttpHeaders();
+        originalHeaders.putAll(request.getHeaders());
+
+        // 1) read full request body (bounded)
+        return DataBufferUtils.join(request.getBody()).map(dataBuffer -> {
+            int len = dataBuffer.readableByteCount();
+            if (len > maxBodyBytes) {
+                DataBufferUtils.release(dataBuffer);
+                throw new PayloadTooLargeException(new RuntimeException("Request body too large: " + len));
+            }
+            byte[] bytes = new byte[len];
+            dataBuffer.read(bytes);
+            DataBufferUtils.release(dataBuffer);
+            return bytes;
+        }).defaultIfEmpty(new byte[0])
+          .flatMap(bodyBytes -> {
+              // 2) Determine content-type
+              String contentType = request.getHeaders().getFirst(HttpHeaders.CONTENT_TYPE);
+              byte[] decryptedBody;
+              try {
+                  if (bodyBytes.length == 0) {
+                      decryptedBody = bodyBytes;
+                  } else if (contentType != null && contentType.toLowerCase().startsWith("multipart/")) {
+                      // multipart: selectively decrypt named form fields, leave files intact
+                      decryptedBody = handleMultipartDecrypt(bodyBytes, contentType);
+                  } else {
+                      // normal single payload: decrypt whole body as UTF-8 text
+                      String encryptedText = new String(bodyBytes, StandardCharsets.UTF_8);
+                      String decryptedText = AESCryptoUtils.decrypt(encryptedText);
+                      decryptedBody = decryptedText.getBytes(StandardCharsets.UTF_8);
+                  }
+              } catch (DecryptionException dex) {
+                  log.warn("Body decryption failed", dex);
+                  return Mono.error(dex);
+              } catch (Exception e) {
+                  log.warn("Body decryption failed", e);
+                  return Mono.error(new DecryptionException("Failed to decrypt request body", e));
+              }
+
+              // 3) Decrypt headers if needed (example header X-Enc-Header)
+              HttpHeaders mutatedHeaders = new HttpHeaders();
+              mutatedHeaders.putAll(originalHeaders);
+
+              List<String> encHeader = mutatedHeaders.getOrDefault("X-Enc-Header", List.of());
+              if (!encHeader.isEmpty()) {
+                  try {
+                      String dec = AESCryptoUtils.decrypt(encHeader.get(0));
+                      mutatedHeaders.set("X-Enc-Header", dec);
+                  } catch (Exception e) {
+                      log.warn("Header decryption failed", e);
+                      // continue with original header if decryption fails
+                  }
+              }
+
+              // 4) Decrypt query params
+              MultiValueMap<String, String> queryParams = new LinkedMultiValueMap<>();
+              request.getQueryParams().forEach((key, values) -> {
+                  List<String> decryptedValues = new ArrayList<>();
+                  for (String value : values) {
+                      try {
+                          decryptedValues.add(AESCryptoUtils.decrypt(value));
+                      } catch (Exception e) {
+                          decryptedValues.add(value); // fallback to original
+                          log.warn("Query param decryption failed for key {}", key);
+                      }
+                  }
+                  queryParams.put(key, decryptedValues);
+              });
+
+              // 5) Decrypt path variables (if any)
+              Map<String, String> pathVars = exchange
+                      .getAttributeOrDefault(ServerWebExchangeUtils.URI_TEMPLATE_VARIABLES_ATTRIBUTE, Map.of());
+              Map<String, String> decryptedPathVars = new HashMap<>();
+              pathVars.forEach((key, value) -> {
+                  try {
+                      decryptedPathVars.put(key, AESCryptoUtils.decrypt(value));
+                  } catch (Exception e) {
+                      decryptedPathVars.put(key, value);
+                      log.warn("Path variable decryption failed for key {}", key);
+                  }
+              });
+              exchange.getAttributes().put(ServerWebExchangeUtils.URI_TEMPLATE_VARIABLES_ATTRIBUTE, decryptedPathVars);
+
+              // 6) Build mutated request with decrypted body and updated query params
+              ServerHttpRequest mutatedRequestBase = request.mutate()
+                      .uri(UriComponentsBuilder.fromUri(request.getURI()).replaceQueryParams(queryParams).build().toUri())
+                      .build();
+
+              // Decorator for mutated request with decrypted body and updated headers
+              ServerHttpRequestDecorator requestDecorator = new ServerHttpRequestDecorator(mutatedRequestBase) {
+                  final HttpHeaders headers = new HttpHeaders();
+                  {
+                      headers.putAll(mutatedHeaders);
+                      // remove content-length and set correct one (will be set on response delegate later)
+                      headers.remove(HttpHeaders.CONTENT_LENGTH);
+                      headers.setContentLength(decryptedBody.length);
+                  }
+
+                  @Override
+                  public HttpHeaders getHeaders() {
+                      return headers;
+                  }
+
+                  @Override
+                  public Flux<DataBuffer> getBody() {
+                      // using ISO_8859_1 for body bytes transport is safer for binary content
+                      return Flux.just(((ReactiveHttpOutputMessage) super.getDelegate()).bufferFactory().wrap(decryptedBody));
+                  }
+              };
+
+              ServerWebExchange mutatedExchange = exchange.mutate().request(requestDecorator).build();
+
+              // 7) Decide whether to validate JWT — check public endpoints patterns
+              String path = mutatedExchange.getRequest().getPath().pathWithinApplication().value();
+              boolean isPublic = publicEndpointPatterns.stream().anyMatch(pattern -> {
+                  try {
+                      return pathMatcher.match(pattern, path);
+                  } catch (Exception e) {
+                      return false;
+                  }
+              });
+
+              // token extraction (still attempt, but may skip validation)
+              String jwtHeader = requestDecorator.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+              String token = null;
+              if (jwtHeader != null && !jwtHeader.isBlank()) {
+                  token = jwtHeader.startsWith("Bearer ") ? jwtHeader.substring(7).trim() : jwtHeader.trim();
+              }
+
+              // If endpoint is public, skip auth validation. But we still decrypt/encrypt payloads.
+              Mono<Void> authMono;
+              if (isPublic) {
+                  log.debug("Request matched public endpoint (no JWT validation): {}", path);
+                  authMono = Mono.empty();
+              } else {
+                  if (token == null || token.isBlank()) {
+                      return Mono.error(new UnauthorizedException("Missing Authorization header"));
+                  }
+                  authMono = authClient.validateToken(token, correlationId)
+                          .onErrorMap(throwable -> {
+                              if (throwable instanceof java.net.ConnectException || throwable instanceof TimeoutException) {
+                                  return new ServiceUnavailableException("Auth service unavailable", throwable);
+                              }
+                              return throwable;
+                          }).then();
+              }
+
+              // 8) After auth (or skip), decorate response to encrypt 2xx responses and forward
+              return authMono.then(Mono.defer(() -> {
+                  ServerHttpResponse originalResponse = mutatedExchange.getResponse();
+
+                  ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+                      AtomicBoolean written = new AtomicBoolean(false);
+
+                      @Override
+                      public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
+                          if (written.getAndSet(true)) {
+                              return super.writeWith(body);
+                          }
+
+                          HttpStatus status = (HttpStatus) getDelegate().getStatusCode();
+                          boolean is2xx = status != null && status.is2xxSuccessful();
+
+                          if (is2xx) {
+                              Flux<? extends DataBuffer> flux = (body instanceof Flux) ? (Flux<? extends DataBuffer>) body
+                                      : Flux.from(body);
+                              return super.writeWith(flux.collectList().flatMapMany(list -> {
+                                  int total = list.stream().mapToInt(DataBuffer::readableByteCount).sum();
+                                  byte[] combined = new byte[total];
+                                  int pos = 0;
+                                  for (DataBuffer db : list) {
+                                      int r = db.readableByteCount();
+                                      db.read(combined, pos, r);
+                                      pos += r;
+                                      DataBufferUtils.release(db);
+                                  }
+
+                                  // Determine content-type
+                                  String ct = getDelegate().getHeaders().getFirst(HttpHeaders.CONTENT_TYPE);
+                                  boolean isText = ct != null && (ct.startsWith("text/")
+                                          || ct.contains("json") || ct.contains("xml") || ct.contains("javascript"));
+
+                                  try {
+                                      if (isText) {
+                                          String plainText = new String(combined, StandardCharsets.UTF_8);
+                                          String encryptedText = AESCryptoUtils.encrypt(plainText);
+                                          byte[] enc = encryptedText.getBytes(StandardCharsets.UTF_8);
+                                          getDelegate().getHeaders().setContentLength(enc.length);
+                                          return Flux.just(getDelegate().bufferFactory().wrap(enc));
+                                      } else {
+                                          // Binary-safe encryption: encrypt bytes and return base64 string
+                                          byte[] encBytes = AESCryptoUtils.encryptBytes(combined);
+                                          String base64 = Base64.getEncoder().encodeToString(encBytes);
+                                          byte[] out = base64.getBytes(StandardCharsets.UTF_8);
+                                          getDelegate().getHeaders().setContentType(MediaType.TEXT_PLAIN);
+                                          getDelegate().getHeaders().setContentLength(out.length);
+                                          return Flux.just(getDelegate().bufferFactory().wrap(out));
+                                      }
+                                  } catch (Exception e) {
+                                      log.error("Response encryption failed; sending original body", e);
+                                      getDelegate().getHeaders().setContentLength(combined.length);
+                                      return Flux.just(getDelegate().bufferFactory().wrap(combined));
+                                  }
+                              }));
+                          } else {
+                              return super.writeWith(body);
+                          }
+                      }
+
+                      @Override
+                      public Mono<Void> writeAndFlushWith(Publisher<? extends Publisher<? extends DataBuffer>> body) {
+                          return writeWith(Flux.from(body).flatMapSequential(p -> p));
+                      }
+                  };
+
+                  return chain.filter(mutatedExchange.mutate().response(decoratedResponse).build());
+              }));
+          }).onErrorResume(throwable -> handleError(exchange, throwable));
+    }
+
+    /**
+     * Very small multipart parser that finds parts (by boundary) and decrypts named
+     * form fields from encryptedMultipartFieldNames. It uses ISO_8859_1 to preserve
+     * raw bytes for file parts. This is intentionally conservative: it only
+     * modifies the body byte content of parts whose Content-Disposition contains
+     * name="<field>" that matches encryptedMultipartFieldNames.
+     *
+     * Caveats:
+     * - This is not a full RFC-safe multipart parser. It works for typical
+     *   browser/form submissions and most clients. If you expect extreme cases,
+     *   switch to a proper reactive multipart parser and reconstruct the body.
+     */
+    private byte[] handleMultipartDecrypt(byte[] bodyBytes, String contentType) throws DecryptionException {
+        // extract boundary
+        String lower = contentType.toLowerCase();
+        int bidx = lower.indexOf("boundary=");
+        if (bidx < 0) {
+            throw new DecryptionException("Missing multipart boundary");
+        }
+        String boundary = contentType.substring(bidx + "boundary=".length());
+        // strip quotes
+        if (boundary.startsWith("\"") && boundary.endsWith("\"")) {
+            boundary = boundary.substring(1, boundary.length() - 1);
+        }
+        String dashBoundary = "--" + boundary;
+
+        // Use ISO_8859_1 to preserve binary content when converting to string and back
+        String bodyStr = new String(bodyBytes, java.nio.charset.StandardCharsets.ISO_8859_1);
+        String[] parts = bodyStr.split(dashBoundary, -1); // keep trailing
+        if (parts.length <= 1) {
+            // not a standard multipart body -- return original bytes
+            return bodyBytes;
+        }
+
+        StringBuilder rebuilt = new StringBuilder();
+        // first element may be preamble; include the initial boundary
+        rebuilt.append(dashBoundary);
+        for (int i = 1; i < parts.length; i++) {
+            String part = parts[i];
+            // final boundary ends with --
+            if (part.equals("--") || part.startsWith("--\r\n") || part.startsWith("--\n")) {
+                rebuilt.append(part);
+                continue;
+            }
+
+            // part begins with CRLF; trim leading newline if present
+            if (part.startsWith("\r\n")) {
+                part = part.substring(2);
+            } else if (part.startsWith("\n")) {
+                part = part.substring(1);
+            }
+
+            // locate headers (headers end at first blank line)
+            int idx = indexOfDoubleNewline(part);
+            if (idx < 0) {
+                // malformed; append as-is
+                rebuilt.append(part);
+                continue;
+            }
+            String headersSection = part.substring(0, idx);
+            String valueSection = part.substring(idx + delimiterLength(part, idx));
+            // check content-disposition header for name="..."
+            String cd = findHeaderIgnoreCase(headersSection, "Content-Disposition");
+            boolean shouldDecrypt = false;
+            String name = null;
+            if (cd != null) {
+                // try find name="..."
+                int nameIdx = cd.indexOf("name=");
+                if (nameIdx >= 0) {
+                    int quoteStart = cd.indexOf('"', nameIdx);
+                    int quoteEnd = quoteStart >= 0 ? cd.indexOf('"', quoteStart + 1) : -1;
+                    if (quoteStart >= 0 && quoteEnd > quoteStart) {
+                        name = cd.substring(quoteStart + 1, quoteEnd);
+                        if (encryptedMultipartFieldNames.contains(name)) {
+                            shouldDecrypt = true;
+                        }
+                    }
+                }
+            }
+
+            if (shouldDecrypt) {
+                try {
+                    // valueSection currently includes the part body up to the boundary marker.
+                    // Decrypt it as UTF-8 text (common case: encrypted JSON/strings)
+                    // Value section might end with trailing CRLF; preserve that.
+                    // Trim trailing CRLFs for decryption, preserve them afterward.
+                    String trailing = "";
+                    if (valueSection.endsWith("\r\n")) {
+                        trailing = "\r\n";
+                        valueSection = valueSection.substring(0, valueSection.length() - 2);
+                    } else if (valueSection.endsWith("\n")) {
+                        trailing = "\n";
+                        valueSection = valueSection.substring(0, valueSection.length() - 1);
+                    }
+                    // valueSection is ISO_8859_1 encoded - convert to UTF-8 string
+                    String encryptedText = new String(valueSection.getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8);
+                    String decryptedText = AESCryptoUtils.decrypt(encryptedText);
+                    // put decrypted text back in ISO_8859_1 so binary parts unaffected
+                    String decryptedIso = new String(decryptedText.getBytes(StandardCharsets.UTF_8), StandardCharsets.ISO_8859_1);
+                    rebuilt.append("\r\n").append(headersSection).append("\r\n\r\n").append(decryptedIso).append(trailing);
+                } catch (Exception e) {
+                    log.warn("Failed to decrypt multipart field '{}'; leaving original content", name, e);
+                    // on failure preserve original
+                    rebuilt.append("\r\n").append(headersSection).append("\r\n\r\n").append(valueSection);
+                }
+            } else {
+                // not targeted for decryption — append original part exactly
+                rebuilt.append("\r\n").append(headersSection).append("\r\n\r\n").append(valueSection);
+            }
+
+            // append boundary prefix for next iteration
+            if (i < parts.length - 1) {
+                rebuilt.append(dashBoundary);
+            }
+        }
+
+        // Convert rebuilt to bytes with ISO_8859_1 to preserve binary content
+        return rebuilt.toString().getBytes(StandardCharsets.ISO_8859_1);
+    }
+
+    // find the first blank line (CRLF CRLF or LF LF) index
+    private int indexOfDoubleNewline(String s) {
+        int idx = s.indexOf("\r\n\r\n");
+        if (idx >= 0) return idx;
+        idx = s.indexOf("\n\n");
+        return idx;
+    }
+
+    // return 4 for \r\n\r\n, 2 for \n\n
+    private int delimiterLength(String s, int idx) {
+        if (s.length() >= idx + 4 && s.substring(idx, idx + 4).equals("\r\n\r\n")) return 4;
+        return 2;
+    }
+
+    // look for header name in headers section (case-insensitive)
+    private String findHeaderIgnoreCase(String headers, String headerName) {
+        String[] lines = headers.split("\r\n|\n");
+        for (String line : lines) {
+            if (line.toLowerCase().startsWith(headerName.toLowerCase() + ":")) {
+                return line.substring(line.indexOf(':') + 1).trim();
+            }
+        }
+        return null;
+    }
+
+    private Mono<Void> handleError(ServerWebExchange exchange, Throwable throwable) {
+        log.error("Filter error: {}", throwable.getMessage());
+        if (exchange.getResponse().isCommitted()) {
+            return Mono.error(throwable);
+        }
+        HttpStatus status;
+        String errorType;
+        if (throwable instanceof UnauthorizedException) {
+            status = HttpStatus.UNAUTHORIZED;
+            errorType = "Unauthorized";
+        } else if (throwable instanceof PayloadTooLargeException) {
+            status = HttpStatus.PAYLOAD_TOO_LARGE;
+            errorType = "PayloadTooLarge";
+        } else if (throwable instanceof ServiceUnavailableException) {
+            status = HttpStatus.SERVICE_UNAVAILABLE;
+            errorType = "AuthServiceUnavailable";
+        } else if (throwable instanceof DecryptionException) {
+            status = HttpStatus.BAD_REQUEST;
+            errorType = "DecryptionError";
+        } else {
+            status = HttpStatus.INTERNAL_SERVER_ERROR;
+            errorType = "InternalServerError";
+        }
+        exchange.getResponse().setStatusCode(status);
+        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        byte[] bytes = ("{\"error\":\"" + errorType + "\",\"message\":\"" +
+                Optional.ofNullable(throwable.getMessage()).orElse("") + "\"}")
+                .getBytes(StandardCharsets.UTF_8);
+        return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+    }
+
+    private static long parseSize(String s) {
+        if (s == null)
+            return 1048576L;
+        s = s.trim().toUpperCase();
+        try {
+            if (s.endsWith("MB"))
+                return Long.parseLong(s.replace("MB", "")) * 1024 * 1024;
+            if (s.endsWith("KB"))
+                return Long.parseLong(s.replace("KB", "")) * 1024;
+            if (s.endsWith("B"))
+                return Long.parseLong(s.replace("B", ""));
+            return Long.parseLong(s);
+        } catch (NumberFormatException e) {
+            return 1048576L;
+        }
+    }
+
+    private static List<String> parseCsv(String s) {
+        if (s == null || s.isBlank()) return List.of();
+        return List.of(s.split(",")).stream().map(String::trim).collect(Collectors.toList());
+    }
+}

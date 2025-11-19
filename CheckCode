@@ -1,0 +1,207 @@
+@Slf4j
+@Component
+public class RequestDecResponseEncFilter implements GlobalFilter, Ordered {
+
+	private final AuthServiceClient authClient;
+	private final long maxBodyBytes;
+
+	public RequestDecResponseEncFilter(AuthServiceClient authClient,
+			@Value("${gateway.req.max.body.bytes}") String maxBody) {
+		this.authClient = authClient;
+		this.maxBodyBytes = parseSize(maxBody);
+	}
+
+	@Override
+	public int getOrder() {
+		return Ordered.HIGHEST_PRECEDENCE + 10;
+	}
+
+	@Override
+	public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+		String correlationId = exchange.getRequest().getId();
+		exchange.getResponse().getHeaders().add("X-Correlation-Id", correlationId);
+
+		ServerHttpRequest request = exchange.getRequest();
+		HttpHeaders originalHeaders = new HttpHeaders();
+		originalHeaders.putAll(request.getHeaders());
+
+		return DataBufferUtils.join(request.getBody()).map(dataBuffer -> {
+			int len = dataBuffer.readableByteCount();
+			if (len > maxBodyBytes) {
+				DataBufferUtils.release(dataBuffer);
+				throw new PayloadTooLargeException(new RuntimeException("Request body too large: " + len));
+			}
+			byte[] bytes = new byte[len];
+			dataBuffer.read(bytes);
+			DataBufferUtils.release(dataBuffer);
+			return bytes;
+		}).defaultIfEmpty(new byte[0]).flatMap(bodyBytes -> {
+			byte[] decryptedBody;
+			try {
+				if (bodyBytes.length == 0) {
+					decryptedBody = bodyBytes;
+				} else {
+					String encryptedText = new String(bodyBytes, StandardCharsets.UTF_8);
+					String decryptedText = AESCryptoUtils.decrypt(encryptedText);
+					decryptedBody = decryptedText.getBytes(StandardCharsets.UTF_8);
+				}
+			} catch (Exception e) {
+				log.warn("Body decryption failed", e);
+				throw new DecryptionException("Failed to decrypt request body", e);
+			}
+
+			HttpHeaders mutatedHeaders = new HttpHeaders();
+			mutatedHeaders.putAll(originalHeaders);
+
+		List<String> encHeader = mutatedHeaders.getOrDefault("X-Enc-Header", List.of());
+			if (!encHeader.isEmpty()) {
+				try {
+					String dec = AESCryptoUtils.decrypt(encHeader.get(0));
+					mutatedHeaders.set("X-Enc-Header", dec);
+				} catch (Exception e) {
+					log.warn("Header decryption failed", e);
+				}
+			}
+
+		MultiValueMap<String, String> queryParams = new LinkedMultiValueMap<>();
+			request.getQueryParams().forEach((key, values) -> {
+				List<String> decryptedValues = new ArrayList<>();
+				for (String value : values) {
+					try {
+						decryptedValues.add(AESCryptoUtils.decrypt(value));
+					} catch (Exception e) {
+						decryptedValues.add(value); 
+						log.warn("Query param decryption failed for key {}", key);
+					}
+				}
+				queryParams.put(key, decryptedValues);
+			});
+
+		Map<String, String> pathVars = exchange
+				.getAttributeOrDefault(ServerWebExchangeUtils.URI_TEMPLATE_VARIABLES_ATTRIBUTE, Map.of());
+			Map<String, String> decryptedPathVars = new HashMap<>();
+			pathVars.forEach((key, value) -> {
+				try {
+					decryptedPathVars.put(key, AESCryptoUtils.decrypt(value));
+				} catch (Exception e) {
+					decryptedPathVars.put(key, value);
+					log.warn("Path variable decryption failed for key {}", key);
+				}
+			});
+			exchange.getAttributes().put(ServerWebExchangeUtils.URI_TEMPLATE_VARIABLES_ATTRIBUTE, decryptedPathVars);
+
+		ServerHttpRequest mutatedRequestBase = request.mutate().headers(h -> h.clear())
+			.uri(UriComponentsBuilder.fromUri(request.getURI()).replaceQueryParams(queryParams).build().toUri())
+					.build();
+
+			ServerHttpRequestDecorator requestDecorator = new ServerHttpRequestDecorator(mutatedRequestBase) {
+				@Override
+				public HttpHeaders getHeaders() {
+					return mutatedHeaders;
+				}
+
+				@Override
+				public Flux<DataBuffer> getBody() {
+					return Flux.just(exchange.getResponse().bufferFactory().wrap(decryptedBody));
+				}
+			};
+
+			ServerWebExchange mutatedExchange = exchange.mutate().request(requestDecorator).build();
+
+			String jwt = mutatedHeaders.getFirst(HttpHeaders.AUTHORIZATION);
+			if (jwt == null || jwt.isBlank()) {
+				return Mono.error(new UnauthorizedException("Missing Authorization header"));
+			}
+
+			return authClient.validateToken(jwt, correlationId).then(Mono.defer(() -> {
+				ServerHttpResponse originalResponse = mutatedExchange.getResponse();
+				ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+					AtomicBoolean written = new AtomicBoolean(false);
+
+					@Override
+					public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
+						if (written.getAndSet(true)) {
+							return super.writeWith(body);
+						}
+
+						HttpStatus status = (HttpStatus) getStatusCode();
+						if (status != null && status.is2xxSuccessful()) {
+							Flux<? extends DataBuffer> flux = (body instanceof Flux) ? (Flux<? extends DataBuffer>) body
+									: Flux.from(body);
+							return super.writeWith(flux.collectList().flatMapMany(list -> {
+								int total = list.stream().mapToInt(DataBuffer::readableByteCount).sum();
+								byte[] combined = new byte[total];
+								int pos = 0;
+								for (DataBuffer db : list) {
+									int r = db.readableByteCount();
+									db.read(combined, pos, r);
+									pos += r;
+									DataBufferUtils.release(db);
+								}
+								try {
+									String plainText = new String(combined, StandardCharsets.UTF_8);
+									String encryptedText = AESCryptoUtils.encrypt(plainText);
+									byte[] enc = encryptedText.getBytes(StandardCharsets.UTF_8);
+									return Flux.just(getDelegate().bufferFactory().wrap(enc));
+								} catch (Exception e) {
+									log.error("Response encryption failed; sending original body", e);
+									return Flux.just(getDelegate().bufferFactory().wrap(combined));
+								}
+							}));
+						} else {
+							return super.writeWith(body);
+						}
+					}
+
+@Override
+					public Mono<Void> writeAndFlushWith(Publisher<? extends Publisher<? extends DataBuffer>> body) {
+						return writeWith(Flux.from(body).flatMapSequential(p -> p));
+					}
+				};
+
+				return chain.filter(mutatedExchange.mutate().response(decoratedResponse).build());
+			}));
+		}).onErrorResume(throwable -> handleError(exchange, throwable));
+	}
+
+	private Mono<Void> handleError(ServerWebExchange exchange, Throwable throwable) {
+		log.error("Filter error: {}", throwable.getMessage());
+		HttpStatus status;
+		String errorType;
+		if (throwable instanceof UnauthorizedException) {
+			status = HttpStatus.UNAUTHORIZED;
+			errorType = "Unauthorized";
+		} else if (throwable instanceof PayloadTooLargeException) {
+			status = HttpStatus.PAYLOAD_TOO_LARGE;
+			errorType = "PayloadTooLarge";
+		} else if (throwable instanceof ServiceUnavailableException) {
+			status = HttpStatus.SERVICE_UNAVAILABLE;
+			errorType = "AuthServiceUnavailable";
+		} else {
+			status = HttpStatus.INTERNAL_SERVER_ERROR;
+			errorType = "InternalServerError";
+		}
+		exchange.getResponse().setStatusCode(status);
+		byte[] bytes = ("{\"error\":\"" + errorType + "\",\"message\":\"" + throwable.getMessage() + "\"}")
+				.getBytes(StandardCharsets.UTF_8);
+		return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(bytes)));
+	}
+
+	private static long parseSize(String s) {
+		if (s == null)
+			return 1048576L;
+		s = s.trim().toUpperCase();
+		try {
+			if (s.endsWith("MB"))
+				return Long.parseLong(s.replace("MB", "")) * 1024 * 1024;
+			if (s.endsWith("KB"))
+				return Long.parseLong(s.replace("KB", "")) * 1024;
+			if (s.endsWith("B"))
+				return Long.parseLong(s.replace("B", ""));
+			return Long.parseLong(s);
+		} catch (NumberFormatException e) {
+			return 1048576L;
+		}
+	}
+}
+will above code work like first it will decrypt request then pass to auth microservice call for token validation if auth success then pass to next respective service receives response and then  gateway will encrypt it if no error?
